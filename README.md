@@ -1,8 +1,9 @@
 # graphdblite (Arup's bug fixed version)
 
 Embedded graph database with Cypher support, built on SQLite.
-[List of bugs fixed by Claude Opus 5.5](BUGS_FIXED.md)
 
+- [List of bugs fixed by Claude Opus 5.5](BUGS_FIXED.md)
+- [Comprehensive Documentation](GRAPHDBLITE_REFERENCE.md)
 
 **Embedded.** Single file, no server, no configuration. Open it, query it, close it — like SQLite.
 
