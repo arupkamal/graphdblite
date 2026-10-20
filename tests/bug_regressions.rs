@@ -820,3 +820,70 @@ fn extra_shortest_path_bound_endpoint_constraints_apply() {
     );
     assert!(rows.is_empty(), "c lacks :Missing, got {rows:?}");
 }
+
+// ── #17 MERGE ON CREATE / ON MATCH can read the merged node ───────────────
+
+#[test]
+fn bug17_merge_set_can_read_merged_node_properties() {
+    let mut db = Database::open_memory().unwrap();
+    run(&mut db, "CREATE (:P {name: 'A', age: 1})");
+    let rows = run(
+        &mut db,
+        "MERGE (p:P {name: 'A'}) ON MATCH SET p.visits = coalesce(p.visits, 0) + 1 \
+         RETURN p.visits AS v",
+    );
+    assert_eq!(rows[0].get("v"), Some(&Value::I64(1)));
+    let rows = run(
+        &mut db,
+        "MERGE (p:P {name: 'A'}) ON MATCH SET p.visits = coalesce(p.visits, 0) + 1 \
+         RETURN p.visits AS v",
+    );
+    assert_eq!(rows[0].get("v"), Some(&Value::I64(2)));
+    run(
+        &mut db,
+        "MERGE (p:P {name: 'A'}) ON MATCH SET p += {doubled: p.age * 2}",
+    );
+    assert_eq!(int(&mut db, "MATCH (p:P) RETURN p.doubled"), 2);
+    let rows = run(
+        &mut db,
+        "UNWIND [1] AS i MERGE (p:P {name: 'B'}) ON CREATE SET p.label = p.name + '!' \
+         RETURN p.label AS l",
+    );
+    assert_eq!(rows[0].get("l"), Some(&Value::String("B!".into())));
+}
+
+// ── #18 shortestPath in a second MATCH clause reuses the bound endpoints ──
+
+#[test]
+fn bug18_shortest_path_in_second_match_clause() {
+    let mut db = Database::open_memory().unwrap();
+    run(
+        &mut db,
+        "CREATE (a:N {id: 'A'})-[:LINK]->(b:N {id: 'B'})-[:LINK]->(c:N {id: 'C'})-[:LINK]->(d:N {id: 'D'}), \
+                (d)-[:LINK]->(a), (c)-[:LINK]->(c), (k:N {id: 'K'})",
+    );
+    let rows = run(
+        &mut db,
+        "MATCH (a:N {id: 'A'}), (d:N {id: 'D'}) \
+         MATCH p = shortestPath((a)-[:LINK*]->(d)) RETURN length(p) AS hops",
+    );
+    assert_eq!(rows.len(), 1, "one row per (a, d) pair: {rows:?}");
+    assert_eq!(rows[0].get("hops"), Some(&Value::I64(3)));
+    let rows = run(
+        &mut db,
+        "MATCH (a:N {id: 'A'}), (d:N {id: 'D'}) \
+         MATCH p = allShortestPaths((a)-[*]-(d)) RETURN length(p) AS hops",
+    );
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].get("hops"), Some(&Value::I64(1)));
+    // Unreachable endpoint: one row with a null path.
+    let rows = run(
+        &mut db,
+        "MATCH (a:N {id: 'A'}), (k:N {id: 'K'}) \
+         MATCH p = shortestPath((a)-[:LINK*]->(k)) RETURN p",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("p"), Some(&Value::Null));
+    // Self-loops are counted once.
+    assert_eq!(int(&mut db, "MATCH ()-[r]->() RETURN count(r)"), 5);
+}

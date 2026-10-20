@@ -504,9 +504,10 @@ impl Database {
 
     /// Create a case-insensitive fulltext index on `(label, property)`.
     ///
-    /// Backed by FTS5's `trigram case_sensitive 0` tokenizer — plain
-    /// `CONTAINS` / `STARTS WITH` / `ENDS WITH` against this property
-    /// becomes case-insensitive and FTS-accelerated.
+    /// Backed by FTS5's `trigram case_sensitive 0` tokenizer. Accelerates the
+    /// case-insensitive idiom `toLower(n.prop) CONTAINS toLower($q)` (and
+    /// `STARTS WITH` / `ENDS WITH`); plain predicates keep Cypher's
+    /// case-sensitive semantics.
     ///
     /// Same transaction / error semantics as `create_fulltext_index`.
     pub fn create_fulltext_index_ci(&mut self, label: &str, property: &str) -> Result<()> {

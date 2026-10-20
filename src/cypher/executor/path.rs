@@ -179,9 +179,30 @@ pub(in crate::cypher::executor) fn exec_shortest_path(
     ctx: &ExecContext,
 ) -> Result<Vec<NamedRecord>> {
     let records = exec(conn, input, ctx)?;
+    shortest_path_rows(
+        conn, &records, src_alias, dst_alias, path_alias, edge_types, direction, max_hops,
+        all_paths,
+    )
+}
+
+/// Compute the shortest path(s) for each input row and bind them under
+/// `path_alias`. Shared by the plain and the correlated (multi-`MATCH`)
+/// executors.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::cypher::executor) fn shortest_path_rows(
+    conn: &Connection,
+    records: &[NamedRecord],
+    src_alias: &str,
+    dst_alias: &str,
+    path_alias: &str,
+    edge_types: &[String],
+    direction: Direction,
+    max_hops: u32,
+    all_paths: bool,
+) -> Result<Vec<NamedRecord>> {
     let mut results = Vec::new();
 
-    for rec in &records {
+    for rec in records {
         let src_id = match rec.get(src_alias).and_then(value_to_node_id) {
             Some(id) => id,
             _ => continue,

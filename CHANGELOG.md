@@ -38,6 +38,15 @@ ships.
 - **Setting a property to null** through MERGE or
   `WriteTransaction::set_node_property` no longer writes a Null index entry.
 - **Name-length errors** no longer panic on multi-byte UTF-8 names.
+- **`MERGE … ON CREATE/ON MATCH SET`** can read the merged node's own
+  properties (`ON MATCH SET n.visits = n.visits + 1` previously failed with
+  "property access on Integer").
+- **`shortestPath` in a later `MATCH` clause**
+  (`MATCH (a …), (b …) MATCH p = shortestPath((a)-[*]->(b))`) now uses the
+  `a` / `b` bound by the earlier clause; it previously paired every node with
+  every node and returned one row per pair.
+- **Python: `Database("my.db")`** with a bare relative file name no longer
+  fails with "invalid path".
 - **Cypher writes validate properties**: maps (and lists of maps) are rejected
   in `CREATE`, `MERGE`, `ON CREATE/ON MATCH SET` and `SET n = / += map`, and
   `Config::max_property_value_bytes` / `max_name_bytes` are enforced for

@@ -192,7 +192,12 @@ impl PyDatabase {
                 .canonicalize()
                 .map_err(|e| PyValueError::new_err(format!("invalid path '{path}': {e}")))?
         } else {
-            let parent = resolved.parent().unwrap_or(std::path::Path::new("."));
+            // A bare file name ("my.db") has an empty parent; treat it as the
+            // current directory (canonicalizing "" fails).
+            let parent = match resolved.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => std::path::Path::new("."),
+            };
             let parent = parent
                 .canonicalize()
                 .map_err(|e| PyValueError::new_err(format!("invalid path '{path}': {e}")))?;
@@ -454,9 +459,10 @@ impl PyWriteTransaction {
 
     /// Create a case-insensitive fulltext index on (label, property).
     ///
-    /// Backed by SQLite FTS5's `trigram case_sensitive 0` tokenizer — plain
-    /// `CONTAINS` / `STARTS WITH` / `ENDS WITH` against this property
-    /// becomes case-insensitive and FTS-accelerated.
+    /// Backed by SQLite FTS5's `trigram case_sensitive 0` tokenizer. Accelerates
+    /// the case-insensitive idiom `toLower(n.prop) CONTAINS toLower($q)` (and
+    /// `STARTS WITH` / `ENDS WITH`); plain predicates keep Cypher's
+    /// case-sensitive semantics.
     fn create_fulltext_index_ci(&mut self, label: &str, property: &str) -> PyResult<()> {
         let db = self.get_db_mut()?;
         db.create_fulltext_index_ci(label, property)

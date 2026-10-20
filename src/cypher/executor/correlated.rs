@@ -780,6 +780,26 @@ pub(super) fn exec_correlated(
             exec_aggregate_over_records(conn, &records, group_keys, aggregates)
         }
 
+        // ShortestPath in a later MATCH clause: push the correlation into the
+        // endpoint scans so `a` / `b` bound by an earlier clause are reused
+        // instead of re-scanned (which paired every node with every node).
+        LogicalOp::ShortestPath {
+            input,
+            src_alias,
+            dst_alias,
+            path_alias,
+            edge_types,
+            direction,
+            max_hops,
+            all_paths,
+        } => {
+            let records = exec_correlated(conn, input, outer, ctx)?;
+            super::path::shortest_path_rows(
+                conn, &records, src_alias, dst_alias, path_alias, edge_types, *direction,
+                *max_hops, *all_paths,
+            )
+        }
+
         // MaterializePath: push correlation into the input, then materialize paths.
         LogicalOp::MaterializePath {
             input,

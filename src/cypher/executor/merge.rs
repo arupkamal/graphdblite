@@ -17,11 +17,19 @@ pub(in crate::cypher::executor) fn apply_merge_set_item_node(
     node_id: NodeId,
     rec: &NamedRecord,
 ) -> Result<()> {
+    // Bind the merged node (id, labels and current properties) under its
+    // variable so ON CREATE / ON MATCH expressions can read it, e.g.
+    // `ON MATCH SET n.visits = n.visits + 1`.
+    let bound_rec = |variable: &str| -> Result<NamedRecord> {
+        let node = node::get_node(conn, node_id)?;
+        let mut r = rec.clone();
+        super::util::populate_node_bindings(&mut r, &node, variable);
+        Ok(r)
+    };
     match item {
         SetItem::Property(assignment) => {
             let old = node::get_node(conn, node_id)?;
-            let mut a_rec = rec.clone();
-            a_rec.set(assignment.variable.clone(), Value::I64(node_id.0 as i64));
+            let a_rec = bound_rec(&assignment.variable)?;
             let val = eval_expr(
                 &assignment.value,
                 &a_rec,
@@ -65,8 +73,8 @@ pub(in crate::cypher::executor) fn apply_merge_set_item_node(
             index::update_indexes_for_node(conn, node_id, &new.labels, None, &new.properties)?;
             fts::update_fts_for_node(conn, node_id, &new.labels, None, &new.properties)?;
         }
-        SetItem::MapMerge { variable: _, value } => {
-            let map = resolve_to_map(value, rec, conn)?;
+        SetItem::MapMerge { variable, value } => {
+            let map = resolve_to_map(value, &bound_rec(variable)?, conn)?;
             validate_non_null_entries(&map)?;
             let old = node::get_node(conn, node_id)?;
             let mut new_props = old.properties.clone();
@@ -80,8 +88,8 @@ pub(in crate::cypher::executor) fn apply_merge_set_item_node(
             }
             maintain_indexes_after_prop_change(conn, node_id, &old, &new_props)?;
         }
-        SetItem::MapOverwrite { variable: _, value } => {
-            let map = resolve_to_map(value, rec, conn)?;
+        SetItem::MapOverwrite { variable, value } => {
+            let map = resolve_to_map(value, &bound_rec(variable)?, conn)?;
             validate_non_null_entries(&map)?;
             // Clear existing properties and set new ones.
             let old = node::get_node(conn, node_id)?;
