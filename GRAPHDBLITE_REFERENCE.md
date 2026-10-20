@@ -1,0 +1,2561 @@
+# graphdblite — Complete Function Reference
+
+A practical reference for **every public function** in graphdblite, with small,
+copy-pasteable examples:
+
+1. [Python API](#1-python-api): the `Database`, `WriteTransaction` and `ReadTransaction` classes
+2. [Cypher clauses](#2-cypher-clauses): `MATCH`, `CREATE`, `MERGE`, `SET`, `DELETE`, `WITH`, `UNWIND` and the rest
+3. [Cypher functions](#3-cypher-functions): string, math, list, aggregation, temporal, graph and procedures
+4. [Rust API](#4-rust-api): `Database`, transactions and value types
+
+> Every Cypher and Python example in sections 1–3 was **executed against the
+> patched build** while this document was generated. The `Result:` / `Output:`
+> blocks are real output, shown as Python receives it: a list of dicts, one dict
+> per row. The Rust examples in section 4 were compiled and run too.
+
+---
+
+## Contents
+
+- [The sample graph used in the examples](#the-sample-graph-used-in-the-examples)
+- [Quick start](#quick-start)
+- [1. Python API](#1-python-api)
+  - [Database](#11-database) · [WriteTransaction](#12-writetransaction) · [ReadTransaction](#13-readtransaction) · [Parameters](#14-query-parameters) · [Return values](#15-how-results-come-back) · [Exceptions](#16-exceptions)
+- [2. Cypher clauses](#2-cypher-clauses)
+  - [MATCH](#21-match) · [OPTIONAL MATCH](#22-optional-match) · [WHERE and operators](#23-where-and-operators) · [RETURN / ORDER BY / SKIP / LIMIT](#24-return-order-by-skip-limit) · [WITH](#25-with) · [UNWIND](#26-unwind) · [CREATE](#27-create) · [MERGE](#28-merge) · [SET](#29-set) · [REMOVE](#210-remove) · [DELETE / DETACH DELETE](#211-delete--detach-delete) · [UNION](#212-union--union-all) · [CALL … YIELD](#213-call--yield) · [Paths & shortestPath](#214-path-variables-shortestpath-allshortestpaths) · [Expressions](#215-expressions-case-lists-maps-subqueries) · [Indexes (DDL)](#216-indexes-create-index--drop-index) · [EXPLAIN](#217-explain)
+- [3. Cypher functions](#3-cypher-functions)
+  - [Graph / entity](#31-graph-and-entity-functions) · [Type conversion](#32-type-conversion) · [String](#33-string-functions) · [List](#34-list-functions) · [Math](#35-math-functions) · [Aggregation](#36-aggregation-functions) · [Predicates](#37-list-predicates-all--any--none--single) · [Temporal](#38-temporal-dates-times-durations) · [Procedures](#39-built-in-procedures)
+- [4. Rust API](#4-rust-api)
+- [Appendix: limits and gotchas](#appendix-limits-and-gotchas)
+
+---
+
+## The sample graph used in the examples
+
+Unless an example says otherwise, it runs against this small social graph. Each
+example starts from a fresh copy of it.
+
+```cypher
+CREATE (alice:Person {name: 'Alice', age: 30, city: 'NYC', email: 'alice@example.com'}),
+       (bob:Person   {name: 'Bob',   age: 25, city: 'London'}),
+       (carol:Person {name: 'Carol', age: 35, city: 'NYC', email: 'carol@example.com'}),
+       (dave:Person  {name: 'Dave',  age: 40, city: 'Paris'}),
+       (acme:Company {name: 'Acme', founded: 1999}),
+       (alice)-[:KNOWS {since: 2015}]->(bob),
+       (bob)-[:KNOWS {since: 2018}]->(carol),
+       (alice)-[:KNOWS {since: 2020}]->(carol),
+       (carol)-[:KNOWS {since: 2021}]->(dave),
+       (alice)-[:WORKS_AT {role: 'Engineer'}]->(acme),
+       (carol)-[:WORKS_AT {role: 'Manager'}]->(acme)
+```
+
+```
+Alice ──KNOWS (2015)──▶ Bob ──KNOWS (2018)──▶ Carol ──KNOWS (2021)──▶ Dave
+Alice ──KNOWS (2020)──▶ Carol
+Alice ──WORKS_AT (Engineer)──▶ Acme ◀──WORKS_AT (Manager)── Carol
+```
+
+---
+
+## Quick start
+
+```python
+from graphdblite import Database
+
+db = Database("quickstart.db")                      # creates the file if missing
+
+db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+db.execute("CREATE (:Person {name: 'Bob', age: 25})")
+db.execute("""
+    MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
+    CREATE (a)-[:KNOWS {since: 2020}]->(b)
+""")
+
+rows = db.query("""
+    MATCH (a:Person)-[k:KNOWS]->(b:Person)
+    RETURN a.name AS who, b.name AS knows, k.since AS since
+""")
+print(rows)
+db.close()
+```
+
+Output:
+```text
+[{'who': 'Alice', 'knows': 'Bob', 'since': 2020}]
+```
+
+---
+
+# 1. Python API
+
+```python
+from graphdblite import (
+    Database, WriteTransaction, ReadTransaction,           # classes
+    GraphDBError, ParseError, StorageError, NodeNotFoundError,  # exceptions
+)
+```
+
+A `Database` handle is **not thread-safe**: use one handle per thread, or
+serialize access. Several handles (even in different processes) can open the
+same file safely.
+
+## 1.1 Database
+
+### `Database(path, busy_timeout_ms=5000)`
+
+Opens the database file at `path`, creating it if it doesn't exist.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `path` | `str` | File path. The parent directory must exist. |
+| `busy_timeout_ms` | `int` | How long to wait for another writer's lock before failing (default 5 s). |
+
+```python
+from graphdblite import Database
+
+db = Database("people.db")
+print(db)                                   # shows the resolved absolute path
+db.close()
+
+db = Database("people.db", busy_timeout_ms=20_000)   # wait up to 20 s for locks
+db.close()
+```
+
+Output:
+```text
+Database('/home/you/project/people.db')
+```
+
+### `Database.open_memory()` (static)
+
+Opens a throwaway in-memory database. Handy for tests; nothing is written to disk.
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+db.execute("CREATE (:Temp {x: 1})")
+print(db.query("MATCH (t:Temp) RETURN t.x AS x"))
+```
+
+Output:
+```text
+[{'x': 1}]
+```
+
+### `db.query(cypher, params=None) -> list[dict]`
+
+Runs a **read-only** query in its own read transaction and returns the rows.
+Write clauses (`CREATE`, `SET`, …) are rejected here; use `execute`.
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+db.execute("CREATE (:Person {name: 'Alice', age: 30}), (:Person {name: 'Bob', age: 25})")
+
+print(db.query("MATCH (p:Person) WHERE p.age > $min RETURN p.name AS name",
+               {"min": 26}))
+
+try:
+    db.query("CREATE (:Person {name: 'Eve'})")
+except Exception as e:
+    print(type(e).__name__, "-", str(e).splitlines()[0])
+```
+
+Output:
+```text
+[{'name': 'Alice'}]
+GraphDBError - transaction error: write operations are not permitted inside a read transaction
+```
+
+### `db.execute(cypher, params=None) -> list[dict]`
+
+Runs any query (reads or writes) in its own write transaction. It commits on
+success and rolls back on error. It returns the rows of the query's `RETURN`, or
+`[]` when there is none.
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+print(db.execute("CREATE (p:Person {name: 'Alice'}) RETURN id(p) AS id"))
+print(db.execute("MATCH (p:Person {name: 'Alice'}) SET p.age = 31"))   # no RETURN -> []
+print(db.query("MATCH (p:Person) RETURN p.name AS name, p.age AS age"))
+```
+
+Output:
+```text
+[{'id': 1}]
+[]
+[{'name': 'Alice', 'age': 31}]
+```
+
+### `db.begin_write() -> WriteTransaction`
+
+Starts a **multi-statement** write transaction. Use it as a context manager: it
+commits automatically when the block succeeds and rolls back if an exception
+escapes. While the transaction is open, call methods on `tx`, not on `db`.
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+
+with db.begin_write() as tx:
+    tx.execute("CREATE (:Account {id: 1, balance: 100})")
+    tx.execute("CREATE (:Account {id: 2, balance: 50})")
+# committed here
+
+try:
+    with db.begin_write() as tx:
+        tx.execute("MATCH (a:Account {id: 1}) SET a.balance = a.balance - 70")
+        raise RuntimeError("payment service down")      # -> automatic rollback
+except RuntimeError:
+    pass
+
+print(db.query("MATCH (a:Account) RETURN a.id AS id, a.balance AS balance ORDER BY id"))
+```
+
+Output:
+```text
+[{'id': 1, 'balance': 100}, {'id': 2, 'balance': 50}]
+```
+
+### `db.begin_read() -> ReadTransaction`
+
+Starts a read transaction that sees one consistent **snapshot**, even if other
+processes write in the meantime.
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+db.execute("CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'})")
+
+with db.begin_read() as tx:
+    total = tx.query("MATCH (p:Person) RETURN count(p) AS n")[0]["n"]
+    names = tx.query("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
+print(total, names)
+```
+
+Output:
+```text
+2 [{'name': 'Alice'}, {'name': 'Bob'}]
+```
+
+### `db.snapshot_to(path)`
+
+Writes a consistent, compacted, single-file copy of the database (a backup). The
+target file must not exist, and no transaction may be open on this handle.
+
+```python
+import os
+from graphdblite import Database
+
+db = Database("live.db")
+db.execute("CREATE (:Person {name: 'Alice'})")
+db.snapshot_to("backup.db")
+
+copy = Database("backup.db")
+print(copy.query("MATCH (p) RETURN p.name AS name"), os.path.exists("backup.db"))
+```
+
+Output:
+```text
+[{'name': 'Alice'}] True
+```
+
+### `db.close()` and `with Database(...) as db:`
+
+`close()` releases the file. Using the database as a context manager closes it
+automatically. Calling methods after closing raises `RuntimeError`.
+
+```python
+from graphdblite import Database
+
+with Database("ctx.db") as db:
+    db.execute("CREATE (:X)")
+    print(db.query("MATCH (x:X) RETURN count(x) AS n"))
+print(db)   # Database(<closed>)
+```
+
+Output:
+```text
+[{'n': 1}]
+Database(<closed>)
+```
+
+## 1.2 WriteTransaction
+
+Returned by `db.begin_write()`. Everything you run through it is atomic: it
+either all commits or all rolls back.
+
+### `tx.execute(cypher, params=None)` / `tx.query(cypher, params=None)`
+
+Both run any query inside the transaction (`query` is an alias). Later statements
+see the effects of earlier ones.
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+with db.begin_write() as tx:
+    tx.execute("CREATE (:Person {name: $n})", {"n": "Alice"})
+    print(tx.query("MATCH (p:Person) RETURN p.name AS name"))   # sees the uncommitted row
+```
+
+Output:
+```text
+[{'name': 'Alice'}]
+```
+
+### `tx.commit()` / `tx.rollback()`
+
+End the transaction explicitly. After either call the transaction is finished,
+and further calls raise `RuntimeError`.
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+
+tx = db.begin_write()
+tx.execute("CREATE (:Kept)")
+tx.commit()
+
+tx = db.begin_write()
+tx.execute("CREATE (:Discarded)")
+tx.rollback()
+
+print(db.query("MATCH (n) RETURN labels(n) AS labels"))
+```
+
+Output:
+```text
+[{'labels': ['Kept']}]
+```
+
+### `tx.batch_create_nodes(label, nodes) -> list[int]`
+
+Creates many nodes with one label in a single fast statement. It returns their
+ids in input order. Each dict becomes the node's properties.
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+with db.begin_write() as tx:
+    ids = tx.batch_create_nodes("City", [
+        {"name": "Toronto", "pop": 2_794_356},
+        {"name": "Mississauga", "pop": 717_961},
+    ])
+print(ids)
+print(db.query("MATCH (c:City) RETURN c.name AS name, c.pop AS pop ORDER BY pop DESC"))
+```
+
+Output:
+```text
+[1, 2]
+[{'name': 'Toronto', 'pop': 2794356}, {'name': 'Mississauga', 'pop': 717961}]
+```
+
+### `tx.batch_create_edges(edge_type, edges)`
+
+Creates many relationships of one type. Each item is `(src_id, dst_id)` or
+`(src_id, dst_id, {properties})`. The ids are node ids, e.g. from
+`batch_create_nodes` or `id(n)`.
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+with db.begin_write() as tx:
+    a, b, c = tx.batch_create_nodes("Stop", [{"name": "A"}, {"name": "B"}, {"name": "C"}])
+    tx.batch_create_edges("ROUTE", [(a, b, {"minutes": 7}), (b, c)])
+print(db.query("""
+    MATCH (x:Stop)-[r:ROUTE]->(y:Stop)
+    RETURN x.name AS from, y.name AS to, r.minutes AS minutes ORDER BY from
+"""))
+```
+
+Output:
+```text
+[{'from': 'A', 'to': 'B', 'minutes': 7}, {'from': 'B', 'to': 'C', 'minutes': None}]
+```
+
+### Index management
+
+All index methods are on `WriteTransaction`. They take effect for queries
+immediately, and existing data is indexed when the index is created.
+
+| Method | What it speeds up |
+|---|---|
+| `create_index(label, property)` | `=` lookups on one property: `MATCH (p:Person {email: $e})`, `WHERE p.email = $e` |
+| `drop_index(label, property)` | removes it |
+| `create_composite_index(label, [p1, p2, …])` | `=` lookups on several properties together (also on a leading prefix, e.g. just `p1`) |
+| `drop_composite_index(label, [p1, p2, …])` | removes it |
+| `create_fulltext_index(label, property)` | `CONTAINS`, `STARTS WITH`, `ENDS WITH` (case-sensitive) |
+| `create_fulltext_index_ci(label, property)` | the case-insensitive form `toLower(n.p) CONTAINS toLower($q)` (also serves the plain operators) |
+| `create_fulltext_index_word(label, property)` | ranked word search with `CALL fts.search(...)` |
+| `create_fulltext_index_word_multi(label, [p1, p2, …])` | `fts.search` across several properties (`'*'`) |
+| `drop_fulltext_index(label, property)` | removes any fulltext index on the pair |
+
+Indexes never change query **results**, only speed. The planner picks them
+automatically.
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+with db.begin_write() as tx:
+    tx.execute("CREATE (:Person {email: 'a@x.com', tenant: 1, ext: 'A1', bio: 'Rust and graphs'})")
+    tx.create_index("Person", "email")
+    tx.create_composite_index("Person", ["tenant", "ext"])
+    tx.create_fulltext_index("Person", "bio")
+
+print(db.query("CALL db.indexes() YIELD label, property, kind RETURN * ORDER BY property"))
+print(db.query("EXPLAIN MATCH (p:Person {email: 'a@x.com'}) RETURN p")[0]["plan"])
+```
+
+Output:
+```text
+[{'label': 'Person', 'property': 'bio', 'kind': 'fulltext'}, {'label': 'Person', 'property': 'email', 'kind': 'btree'}, {'label': 'Person', 'property': 'ext', 'kind': 'btree'}, {'label': 'Person', 'property': 'tenant', 'kind': 'btree'}]
+Project (est. 1 rows)
+  IndexLookup :Person.(email = String("a@x.com")) AS p (est. 1 rows)
+```
+
+Case-insensitive search with a `_ci` index:
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+with db.begin_write() as tx:
+    tx.execute("CREATE (:Doc {title: 'Graph Databases 101'}), (:Doc {title: 'cooking'})")
+    tx.create_fulltext_index_ci("Doc", "title")
+
+q = "MATCH (d:Doc) WHERE toLower(d.title) CONTAINS toLower($q) RETURN d.title AS title"
+print(db.query(q, {"q": "GRAPH"}))
+# A plain CONTAINS stays case-sensitive, as Cypher requires:
+print(db.query("MATCH (d:Doc) WHERE d.title CONTAINS 'graph' RETURN d.title AS title"))
+```
+
+Output:
+```text
+[{'title': 'Graph Databases 101'}]
+[]
+```
+
+Word search (BM25-ranked) with a `_word` index:
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+with db.begin_write() as tx:
+    tx.execute("CREATE (:Doc {title: 'A', body: 'graph databases store relationships'})")
+    tx.execute("CREATE (:Doc {title: 'B', body: 'relational databases store tables'})")
+    tx.create_fulltext_index_word("Doc", "body")
+
+print(db.query("""
+    CALL fts.search('Doc', 'body', 'graph OR tables') YIELD node, score
+    RETURN node.title AS title, score > 0 AS relevant ORDER BY title
+"""))
+```
+
+Output:
+```text
+[{'title': 'A', 'relevant': True}, {'title': 'B', 'relevant': True}]
+```
+
+## 1.3 ReadTransaction
+
+Returned by `db.begin_read()`.
+
+| Method | Meaning |
+|---|---|
+| `tx.query(cypher, params=None)` | Run a read-only query against the snapshot. Writes are rejected. |
+| `tx.commit()` | Release the snapshot (also done automatically at the end of a `with` block). |
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+db.execute("CREATE (:N {v: 1})")
+tx = db.begin_read()
+print(tx.query("MATCH (n:N) RETURN n.v AS v"))
+try:
+    tx.query("CREATE (:N {v: 2})")
+except Exception as e:
+    print("rejected:", type(e).__name__)
+tx.commit()
+```
+
+Output:
+```text
+[{'v': 1}]
+rejected: GraphDBError
+```
+
+## 1.4 Query parameters
+
+Pass values as a dict and refer to them as `$name`. Parameters are safer than
+string formatting (no injection) and faster (the query plan is cached). Python
+types map like this: `None`→null, `bool`, `int`, `float`, `str`, `list`, `dict`→map.
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+db.execute("UNWIND $rows AS r CREATE (:Person {name: r.name, tags: r.tags})",
+           {"rows": [{"name": "Alice", "tags": ["admin", "dev"]},
+                     {"name": "Bob",   "tags": ["dev"]}]})
+print(db.query("MATCH (p:Person) WHERE $tag IN p.tags RETURN p.name AS name ORDER BY name",
+               {"tag": "dev"}))
+```
+
+Output:
+```text
+[{'name': 'Alice'}, {'name': 'Bob'}]
+```
+
+## 1.5 How results come back
+
+Each row is a `dict`. A column's key is its `AS` alias, or the expression text
+when there is no alias (`p.name`, `count(*)`). Graph values are converted like
+this:
+
+| Cypher value | Python value |
+|---|---|
+| node | `dict` with `__id`, `__labels` plus its properties |
+| relationship | `dict` with `__src`, `__dst`, `__label` plus its properties |
+| path | `list` of node ids |
+| date / time / datetime / duration | ISO-8601 `str` |
+| list, map | `list`, `dict` |
+
+```python
+from graphdblite import Database
+
+db = Database.open_memory()
+db.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS {since: 2020}]->(:Person {name: 'Bob'})")
+row = db.query("""
+    MATCH p = (a:Person)-[r:KNOWS]->(b)
+    RETURN a, r, p, date('2024-03-15') AS d, a.name
+""")[0]
+for k, v in row.items():
+    print(f"{k!r:12} -> {v!r}")
+```
+
+Output:
+```text
+'a'          -> {'__id': 1, '__labels': ['Person'], 'name': 'Alice'}
+'r'          -> {'__src': 1, '__dst': 2, '__label': 'KNOWS', 'since': 2020}
+'p'          -> [1, 2]
+'d'          -> '2024-03-15'
+'a.name'     -> 'Alice'
+```
+
+## 1.6 Exceptions
+
+| Exception | Raised for |
+|---|---|
+| `GraphDBError` | base class: catch this to handle every database error. Also raised directly for transaction errors, e.g. a write inside `query()` or a read transaction |
+| `ParseError` | any query error: syntax, unknown variable/function, type errors, constraint violations at query time |
+| `StorageError` | SQLite / disk problems (locked database, missing index table, I/O) |
+| `NodeNotFoundError` | a referenced node id doesn't exist |
+| `RuntimeError` | using a closed database or a finished transaction |
+| `ValueError` | bad arguments to Python methods (e.g. an invalid label in `batch_create_nodes`) |
+
+```python
+from graphdblite import Database, GraphDBError, ParseError
+
+db = Database.open_memory()
+for bad in ["MATCH (n RETURN n",                 # syntax
+            "RETURN toUpperr('x')",              # unknown function (with a suggestion)
+            "CREATE (n {m: {nested: 1}})"]:      # maps can't be stored as properties
+    try:
+        db.execute(bad)
+    except ParseError as e:
+        print("ParseError:", str(e).splitlines()[0][:90])
+    except GraphDBError as e:
+        print(type(e).__name__, str(e)[:90])
+```
+
+Output:
+```text
+ParseError: SyntaxError(UnexpectedSyntax) at line 1:10:  --> 1:10
+ParseError: SyntaxError(UnknownFunction) at line 1:8: unknown function `toUpperr`
+ParseError: TypeError(InvalidPropertyType) at runtime: maps, nodes, relationships, and paths cannot be
+```
+
+---
+
+# 2. Cypher clauses
+
+Keywords are case-insensitive (`match` = `MATCH`). Labels, relationship types and
+property names are **case-sensitive**. Comments start with `//`.
+
+## 2.1 MATCH
+
+Finds patterns in the graph. `(n:Label {prop: value})` is a node,
+`-[r:TYPE]->` is a relationship.
+
+All people, sorted:
+
+```cypher
+MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY age
+```
+
+Result:
+```text
+[
+  {'name': 'Bob', 'age': 25},
+  {'name': 'Alice', 'age': 30},
+  {'name': 'Carol', 'age': 35},
+  {'name': 'Dave', 'age': 40},
+]
+```
+
+Inline property filter, outgoing relationships with a variable:
+
+```cypher
+MATCH (a:Person {name: 'Alice'})-[k:KNOWS]->(friend)
+RETURN friend.name AS friend, k.since AS since ORDER BY since
+```
+
+Result:
+```text
+[
+  {'friend': 'Bob', 'since': 2015},
+  {'friend': 'Carol', 'since': 2020},
+]
+```
+
+Direction: `<-[]-` (incoming), `-[]-` (either way). `-->` / `<--` / `--` are
+shorthands that match any type:
+
+```cypher
+MATCH (c:Person {name: 'Carol'})<-[:KNOWS]-(who) RETURN who.name AS knows_carol ORDER BY knows_carol
+```
+
+Result:
+```text
+[
+  {'knows_carol': 'Alice'},
+  {'knows_carol': 'Bob'},
+]
+```
+
+```cypher
+MATCH (c:Person {name: 'Carol'})--(x) RETURN DISTINCT x.name AS neighbour ORDER BY neighbour
+```
+
+Result:
+```text
+[
+  {'neighbour': 'Acme'},
+  {'neighbour': 'Alice'},
+  {'neighbour': 'Bob'},
+  {'neighbour': 'Dave'},
+]
+```
+
+Several relationship types (`|`):
+
+```cypher
+MATCH (a:Person {name: 'Alice'})-[r:KNOWS|WORKS_AT]->(x) RETURN type(r) AS rel, x.name AS target ORDER BY target
+```
+
+Result:
+```text
+[
+  {'rel': 'WORKS_AT', 'target': 'Acme'},
+  {'rel': 'KNOWS', 'target': 'Bob'},
+  {'rel': 'KNOWS', 'target': 'Carol'},
+]
+```
+
+Multiple labels (the node must have **all** of them):
+
+```cypher
+CREATE (:Person:Admin {name: 'Root'})
+;
+MATCH (n:Person:Admin) RETURN n.name AS admin
+```
+
+Result:
+```text
+[{'admin': 'Root'}]
+```
+
+Variable-length paths: `*2` (exactly 2 hops), `*1..3` (1 to 3), `*..2` (up to 2),
+`*` (any length, capped by the server's depth limit):
+
+```cypher
+MATCH (a:Person {name: 'Alice'})-[:KNOWS*2]->(x) RETURN DISTINCT x.name AS two_hops ORDER BY two_hops
+```
+
+Result:
+```text
+[
+  {'two_hops': 'Carol'},
+  {'two_hops': 'Dave'},
+]
+```
+
+```cypher
+MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..3]->(x) RETURN DISTINCT x.name AS reachable ORDER BY reachable
+```
+
+Result:
+```text
+[
+  {'reachable': 'Bob'},
+  {'reachable': 'Carol'},
+  {'reachable': 'Dave'},
+]
+```
+
+Relationship-property filter on a variable-length pattern (applied to **every**
+hop; values can be parameters):
+
+```cypher
+MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..3 {since: $y}]->(x) RETURN x.name AS via_2020_links
+```
+
+Result:
+```text
+[{'via_2020_links': 'Carol'}]
+```
+
+Several comma-separated patterns, which share variables:
+
+```cypher
+MATCH (a:Person)-[:WORKS_AT]->(c:Company), (a)-[:KNOWS]->(b:Person)
+RETURN a.name AS employee, b.name AS knows ORDER BY employee, knows
+```
+
+Result:
+```text
+[
+  {'employee': 'Alice', 'knows': 'Bob'},
+  {'employee': 'Alice', 'knows': 'Carol'},
+  {'employee': 'Carol', 'knows': 'Dave'},
+]
+```
+
+## 2.2 OPTIONAL MATCH
+
+Like `MATCH`, but keeps the row and fills `null` when there's no match (a left
+outer join).
+
+```cypher
+MATCH (p:Person)
+OPTIONAL MATCH (p)-[:WORKS_AT]->(c:Company)
+RETURN p.name AS person, c.name AS employer ORDER BY person
+```
+
+Result:
+```text
+[
+  {'person': 'Alice', 'employer': 'Acme'},
+  {'person': 'Bob', 'employer': None},
+  {'person': 'Carol', 'employer': 'Acme'},
+  {'person': 'Dave', 'employer': None},
+]
+```
+
+## 2.3 WHERE and operators
+
+Comparison, boolean and null checks:
+
+```cypher
+MATCH (p:Person)
+WHERE p.age >= 30 AND p.city <> 'Paris' AND p.email IS NOT NULL
+RETURN p.name AS name ORDER BY name
+```
+
+Result:
+```text
+[
+  {'name': 'Alice'},
+  {'name': 'Carol'},
+]
+```
+
+```cypher
+MATCH (p:Person) WHERE NOT p.city = 'NYC' OR p.age < 26 RETURN p.name AS name ORDER BY name
+```
+
+Result:
+```text
+[
+  {'name': 'Bob'},
+  {'name': 'Dave'},
+]
+```
+
+`XOR`:
+
+```cypher
+MATCH (p:Person) WHERE (p.age > 30) XOR (p.city = 'NYC') RETURN p.name AS name ORDER BY name
+```
+
+Result:
+```text
+[
+  {'name': 'Alice'},
+  {'name': 'Dave'},
+]
+```
+
+String matching: `STARTS WITH`, `ENDS WITH`, `CONTAINS` (case-sensitive) and
+`=~` (regular expression, must match the **whole** string; `(?i)` = ignore case):
+
+```cypher
+MATCH (p:Person)
+WHERE p.name STARTS WITH 'A' OR p.name ENDS WITH 've' OR p.name CONTAINS 'aro'
+RETURN p.name AS name ORDER BY name
+```
+
+Result:
+```text
+[
+  {'name': 'Alice'},
+  {'name': 'Carol'},
+  {'name': 'Dave'},
+]
+```
+
+```cypher
+MATCH (p:Person) WHERE p.email =~ '(?i).*@EXAMPLE\\.com' RETURN p.name AS name ORDER BY name
+```
+
+Result:
+```text
+[
+  {'name': 'Alice'},
+  {'name': 'Carol'},
+]
+```
+
+List membership:
+
+```cypher
+MATCH (p:Person) WHERE p.city IN ['London', 'Paris'] RETURN p.name AS name ORDER BY name
+```
+
+Result:
+```text
+[
+  {'name': 'Bob'},
+  {'name': 'Dave'},
+]
+```
+
+Pattern predicate and `EXISTS { … }` (does a pattern exist?):
+
+```cypher
+MATCH (p:Person) WHERE (p)-[:WORKS_AT]->(:Company) RETURN p.name AS employed ORDER BY employed
+```
+
+Result:
+```text
+[
+  {'employed': 'Alice'},
+  {'employed': 'Carol'},
+]
+```
+
+```cypher
+MATCH (p:Person)
+WHERE EXISTS { (p)-[:KNOWS]->(f:Person) WHERE f.age > 32 }
+RETURN p.name AS knows_someone_over_32 ORDER BY knows_someone_over_32
+```
+
+Result:
+```text
+[
+  {'knows_someone_over_32': 'Alice'},
+  {'knows_someone_over_32': 'Bob'},
+  {'knows_someone_over_32': 'Carol'},
+]
+```
+
+| Operator group | Operators |
+|---|---|
+| Arithmetic | `+ - * / % ^` (integer `/` truncates; `^` is power) |
+| Comparison | `= <> < > <= >=` |
+| Boolean | `AND OR XOR NOT` |
+| Null | `IS NULL`, `IS NOT NULL` |
+| String | `+` (concatenate), `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~` |
+| List | `+` (concatenate), `IN`, `[i]`, `[from..to]` |
+| Map / property | `m.key`, `n.prop` |
+
+```cypher
+RETURN 7 / 2 AS int_div, 7.0 / 2 AS float_div, 7 % 3 AS modulo, 2 ^ 10 AS power,
+       'graph' + 'db' AS concat, [1, 2] + [3] AS list_concat, null = null AS null_eq
+```
+
+Result:
+```text
+[
+ {'int_div': 3,
+  'float_div': 3.5,
+  'modulo': 1,
+  'power': 1024.0,
+  'concat': 'graphdb',
+  'list_concat': [1, 2, 3],
+  'null_eq': None}
+]
+```
+
+## 2.4 RETURN, ORDER BY, SKIP, LIMIT
+
+`RETURN` picks the output columns. `AS` names a column; `DISTINCT` removes
+duplicate rows; `*` returns every variable.
+
+```cypher
+MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY city
+```
+
+Result:
+```text
+[
+  {'city': 'London'},
+  {'city': 'NYC'},
+  {'city': 'Paris'},
+]
+```
+
+`ORDER BY` (`ASC` default, `DESC`), `SKIP n`, `LIMIT n`. Paging:
+
+```cypher
+MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY age DESC SKIP 1 LIMIT 2
+```
+
+Result:
+```text
+[
+  {'name': 'Carol', 'age': 35},
+  {'name': 'Alice', 'age': 30},
+]
+```
+
+Several sort keys:
+
+```cypher
+MATCH (p:Person) RETURN p.city AS city, p.name AS name ORDER BY city ASC, name DESC
+```
+
+Result:
+```text
+[
+  {'city': 'London', 'name': 'Bob'},
+  {'city': 'NYC', 'name': 'Carol'},
+  {'city': 'NYC', 'name': 'Alice'},
+  {'city': 'Paris', 'name': 'Dave'},
+]
+```
+
+`RETURN` without `MATCH` evaluates expressions:
+
+```cypher
+RETURN 1 + 2 AS three, 'hi' AS greeting
+```
+
+Result:
+```text
+[{'three': 3, 'greeting': 'hi'}]
+```
+
+## 2.5 WITH
+
+Passes results on to the next part of the query, like a pipe. Use it to filter on
+aggregates, limit early, or rename.
+
+```cypher
+MATCH (p:Person)-[:KNOWS]->(f:Person)
+WITH p, count(f) AS friends
+WHERE friends >= 2
+RETURN p.name AS popular, friends
+```
+
+Result:
+```text
+[{'popular': 'Alice', 'friends': 2}]
+```
+
+```cypher
+MATCH (p:Person)
+WITH p ORDER BY p.age DESC LIMIT 1
+MATCH (p)<-[:KNOWS]-(fan)
+RETURN p.name AS oldest, collect(fan.name) AS known_by
+```
+
+Result:
+```text
+[{'oldest': 'Dave', 'known_by': ['Carol']}]
+```
+
+`WITH DISTINCT`:
+
+```cypher
+MATCH (p:Person) WITH DISTINCT p.city AS city RETURN count(city) AS cities
+```
+
+Result:
+```text
+[{'cities': 3}]
+```
+
+## 2.6 UNWIND
+
+Turns a list into rows. Great for bulk inserts from a parameter.
+
+```cypher
+UNWIND [1, 2, 3] AS x RETURN x, x * x AS square
+```
+
+Result:
+```text
+[
+  {'x': 1, 'square': 1},
+  {'x': 2, 'square': 4},
+  {'x': 3, 'square': 9},
+]
+```
+
+```cypher
+UNWIND $names AS n
+CREATE (:Person {name: n, age: 20})
+;
+MATCH (p:Person) WHERE p.age = 20 RETURN p.name AS new_person ORDER BY new_person
+```
+
+Result:
+```text
+[
+  {'new_person': 'Erin'},
+  {'new_person': 'Frank'},
+]
+```
+
+## 2.7 CREATE
+
+Creates nodes and relationships. Properties set to `null` are skipped.
+
+```cypher
+CREATE (e:Person {name: 'Erin', age: 28}) RETURN e.name AS created, labels(e) AS labels
+```
+
+Result:
+```text
+[{'created': 'Erin', 'labels': ['Person']}]
+```
+
+Several nodes plus a relationship in one statement:
+
+```cypher
+CREATE (a:Person {name: 'X'})-[:KNOWS {since: 2024}]->(b:Person {name: 'Y'}),
+       (c:Person {name: 'Z'})
+;
+MATCH (n:Person) OPTIONAL MATCH (n)-[r]->(m) RETURN n.name AS n, type(r) AS rel, m.name AS m ORDER BY n
+```
+
+Result:
+```text
+[
+  {'n': 'X', 'rel': 'KNOWS', 'm': 'Y'},
+  {'n': 'Y', 'rel': None, 'm': None},
+  {'n': 'Z', 'rel': None, 'm': None},
+]
+```
+
+Connect existing nodes (`MATCH` first, then `CREATE`):
+
+```cypher
+MATCH (b:Person {name: 'Bob'}), (d:Person {name: 'Dave'})
+CREATE (b)-[r:KNOWS {since: 2024}]->(d)
+RETURN type(r) AS created
+```
+
+Result:
+```text
+[{'created': 'KNOWS'}]
+```
+
+Properties can be numbers, strings, booleans, temporal values, or lists of them.
+**Maps (and lists of maps) are rejected**:
+
+```cypher
+CREATE (n:Bad {settings: {theme: 'dark'}})
+```
+
+Result: raises `ParseError`
+```text
+TypeError(InvalidPropertyType) at runtime: maps, nodes, relationships, and paths cannot be stored as properties
+```
+
+## 2.8 MERGE
+
+"Find or create." It matches the whole pattern. If nothing matches, it creates
+it. `ON CREATE SET` / `ON MATCH SET` run only in that case.
+
+Node upsert:
+
+```cypher
+MERGE (p:Person {name: 'Alice'})
+ON CREATE SET p.created = true
+ON MATCH SET p.visits = coalesce(p.visits, 0) + 1
+RETURN p.name AS name, p.created AS created, p.visits AS visits
+```
+
+Result:
+```text
+[{'name': 'Alice', 'created': None, 'visits': 1}]
+```
+
+```cypher
+MERGE (p:Person {name: 'Zoe'})
+ON CREATE SET p.created = true
+RETURN p.name AS name, p.created AS created
+```
+
+Result:
+```text
+[{'name': 'Zoe', 'created': True}]
+```
+
+Relationship upsert between existing nodes. Direction matters; an undirected
+`-[]-` matches either direction:
+
+```cypher
+MATCH (a:Person {name: 'Alice'}), (d:Person {name: 'Dave'})
+MERGE (a)-[r:KNOWS]->(d)
+ON CREATE SET r.since = 2025
+RETURN r.since AS since
+;
+MATCH (a:Person {name: 'Alice'}), (d:Person {name: 'Dave'})
+MERGE (a)-[r:KNOWS]->(d)
+ON CREATE SET r.since = 1900
+RETURN r.since AS since_unchanged
+```
+
+Result:
+```text
+[{'since_unchanged': 2025}]
+```
+
+Per-row upsert from a list (multi-label is supported):
+
+```cypher
+UNWIND $ids AS id
+MERGE (t:Ticket:Open {id: id})
+;
+MATCH (t:Ticket:Open) RETURN count(t) AS tickets
+```
+
+Result:
+```text
+[{'tickets': 2}]
+```
+
+## 2.9 SET
+
+Set one property, several properties, replace all properties (`=`), merge
+properties (`+=`), or add labels:
+
+```cypher
+MATCH (p:Person {name: 'Bob'})
+SET p.age = p.age + 1, p.city = 'Berlin'
+RETURN p.age AS age, p.city AS city
+```
+
+Result:
+```text
+[{'age': 26, 'city': 'Berlin'}]
+```
+
+```cypher
+MATCH (p:Person {name: 'Bob'})
+SET p += {nickname: 'Bobby', age: 99}
+RETURN p.name AS name, p.nickname AS nickname, p.age AS age
+```
+
+Result:
+```text
+[{'name': 'Bob', 'nickname': 'Bobby', 'age': 99}]
+```
+
+```cypher
+MATCH (p:Person {name: 'Bob'})
+SET p = {name: 'Robert'}
+RETURN properties(p) AS props
+```
+
+Result:
+```text
+[{'props': {'name': 'Robert'}}]
+```
+
+```cypher
+MATCH (p:Person {name: 'Dave'})
+SET p:Retired:VIP
+RETURN labels(p) AS labels
+```
+
+Result:
+```text
+[{'labels': ['Person', 'Retired', 'VIP']}]
+```
+
+Setting a property to `null` removes it:
+
+```cypher
+MATCH (p:Person {name: 'Alice'}) SET p.email = null RETURN keys(p) AS keys
+```
+
+Result:
+```text
+[{'keys': ['age', 'city', 'name']}]
+```
+
+Properties on relationships work the same way:
+
+```cypher
+MATCH (:Person {name: 'Alice'})-[r:WORKS_AT]->() SET r.role = 'Staff Engineer' RETURN r.role AS role
+```
+
+Result:
+```text
+[{'role': 'Staff Engineer'}]
+```
+
+## 2.10 REMOVE
+
+Removes properties or labels.
+
+```cypher
+MATCH (p:Person {name: 'Carol'})
+REMOVE p.email
+RETURN keys(p) AS keys
+```
+
+Result:
+```text
+[{'keys': ['age', 'city', 'name']}]
+```
+
+```cypher
+CREATE (n:Person:Temp {name: 'T'})
+;
+MATCH (n:Temp) REMOVE n:Temp RETURN labels(n) AS labels
+```
+
+Result:
+```text
+[{'labels': ['Person']}]
+```
+
+## 2.11 DELETE / DETACH DELETE
+
+`DELETE` removes nodes or relationships. A node that still has relationships
+can't be deleted with plain `DELETE`; `DETACH DELETE` removes its relationships
+first.
+
+```cypher
+MATCH (:Person {name: 'Alice'})-[r:KNOWS]->(:Person {name: 'Bob'}) DELETE r
+;
+MATCH (:Person {name: 'Alice'})-[r:KNOWS]->() RETURN count(r) AS alice_knows
+```
+
+Result:
+```text
+[{'alice_knows': 1}]
+```
+
+```cypher
+MATCH (d:Person {name: 'Dave'}) DELETE d
+```
+
+Result: raises `ParseError`
+```text
+ConstraintViolation(DeleteConnectedNode) at runtime: cannot delete node NodeId(4) because it still has relationships. Use DETACH DELETE.
+```
+
+```cypher
+MATCH (d:Person {name: 'Dave'}) DETACH DELETE d
+;
+MATCH (p:Person) RETURN count(p) AS people_left
+```
+
+Result:
+```text
+[{'people_left': 3}]
+```
+
+Deleting something that isn't a node, relationship or path is a type error:
+
+```cypher
+MATCH (p:Person {name: 'Bob'}) WITH p.age AS x DELETE x
+```
+
+Result: raises `ParseError`
+```text
+TypeError(InvalidArgumentType) at runtime: DELETE requires a node, relationship, or path, got I64(25)
+```
+
+## 2.12 UNION / UNION ALL
+
+Combines results of queries with the same column names. `UNION` removes
+duplicates; `UNION ALL` keeps them.
+
+```cypher
+MATCH (p:Person) WHERE p.city = 'NYC' RETURN p.name AS name
+UNION
+MATCH (p:Person) WHERE p.age > 30 RETURN p.name AS name
+```
+
+Result:
+```text
+[
+  {'name': 'Alice'},
+  {'name': 'Carol'},
+  {'name': 'Dave'},
+]
+```
+
+```cypher
+MATCH (p:Person) WHERE p.city = 'NYC' RETURN p.name AS name
+UNION ALL
+MATCH (p:Person) WHERE p.age > 30 RETURN p.name AS name
+```
+
+Result:
+```text
+[
+  {'name': 'Alice'},
+  {'name': 'Carol'},
+  {'name': 'Carol'},
+  {'name': 'Dave'},
+]
+```
+
+## 2.13 CALL … YIELD
+
+Runs a procedure. `YIELD` picks output columns; `YIELD *` or no `YIELD` returns
+all of them. See [3.9 Built-in procedures](#39-built-in-procedures).
+
+```cypher
+CALL db.counts() YIELD kind, name, count
+WITH kind, name, count WHERE kind = 'label'
+RETURN name, count ORDER BY name
+```
+
+Result:
+```text
+[
+  {'name': 'Company', 'count': 1},
+  {'name': 'Person', 'count': 4},
+]
+```
+
+> Filter procedure output with `WITH … WHERE …`; a `WHERE` directly after
+> `YIELD` isn't supported.
+
+## 2.14 Path variables, shortestPath, allShortestPaths
+
+`p = (...)` binds the whole matched path. Use `length(p)`, `nodes(p)` and
+`relationships(p)` on it.
+
+```cypher
+MATCH p = (:Person {name: 'Alice'})-[:KNOWS*2]->(x)
+RETURN [n IN nodes(p) | n.name] AS route, length(p) AS hops ORDER BY route
+```
+
+Result:
+```text
+[
+  {'route': ['Alice', 'Bob', 'Carol'], 'hops': 2},
+  {'route': ['Alice', 'Carol', 'Dave'], 'hops': 2},
+]
+```
+
+`shortestPath` returns one shortest path, `allShortestPaths` returns all paths of
+the minimum length. The type is optional: `[*]` follows any relationship, and
+`[:A|B*]` follows several types. If no path exists, `p` is `null`.
+
+```cypher
+MATCH (a:Person {name: 'Alice'}), (d:Person {name: 'Dave'}),
+      p = shortestPath((a)-[:KNOWS*]->(d))
+RETURN [n IN nodes(p) | n.name] AS route, length(p) AS hops
+```
+
+Result:
+```text
+[{'route': ['Alice', 'Carol', 'Dave'], 'hops': 2}]
+```
+
+```cypher
+MATCH (b:Person {name: 'Bob'}), (acme:Company {name: 'Acme'}),
+      p = shortestPath((b)-[*]-(acme))
+RETURN [n IN nodes(p) | n.name] AS route, [r IN relationships(p) | type(r)] AS via
+```
+
+Result:
+```text
+[{'route': ['Bob', 'Carol', 'Acme'], 'via': ['KNOWS', 'WORKS_AT']}]
+```
+
+```cypher
+MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Carol'}),
+      p = allShortestPaths((a)-[:KNOWS*]-(c))
+RETURN [n IN nodes(p) | n.name] AS route
+```
+
+Result:
+```text
+[{'route': ['Alice', 'Carol']}]
+```
+
+The endpoint can be introduced inside the `shortestPath` itself:
+
+```cypher
+MATCH (a:Person {name: 'Alice'}), p = shortestPath((a)-[:KNOWS*]->(x:Person {name: 'Dave'}))
+RETURN length(p) AS hops
+```
+
+Result:
+```text
+[{'hops': 2}]
+```
+
+## 2.15 Expressions: CASE, lists, maps, subqueries
+
+**CASE** in its generic form (conditions) and its simple form (compare one value):
+
+```cypher
+MATCH (p:Person)
+RETURN p.name AS name,
+       CASE WHEN p.age < 30 THEN 'young' WHEN p.age < 40 THEN 'mid' ELSE 'senior' END AS band,
+       CASE p.city WHEN 'NYC' THEN 'US' WHEN 'London' THEN 'UK' ELSE 'other' END AS country
+ORDER BY name
+```
+
+Result:
+```text
+[
+  {'name': 'Alice', 'band': 'mid', 'country': 'US'},
+  {'name': 'Bob', 'band': 'young', 'country': 'UK'},
+  {'name': 'Carol', 'band': 'mid', 'country': 'US'},
+  {'name': 'Dave', 'band': 'senior', 'country': 'other'},
+]
+```
+
+**List literals, indexing and slicing** (0-based; negative counts from the end;
+`[a..b]` excludes `b`):
+
+```cypher
+WITH [10, 20, 30, 40, 50] AS xs
+RETURN xs[0] AS first, xs[-1] AS last, xs[1..3] AS middle, xs[..2] AS head2, xs[3..] AS tail2
+```
+
+Result:
+```text
+[{'first': 10, 'last': 50, 'middle': [20, 30], 'head2': [10, 20], 'tail2': [40, 50]}]
+```
+
+**List comprehension** `[x IN list WHERE cond | expr]` (both parts optional):
+
+```cypher
+RETURN [x IN range(1, 10) WHERE x % 3 = 0 | x * 100] AS result
+```
+
+Result:
+```text
+[{'result': [300, 600, 900]}]
+```
+
+**Pattern comprehension** `[(a)-->(b) WHERE cond | expr]` collects values from a
+pattern:
+
+```cypher
+MATCH (a:Person {name: 'Alice'})
+RETURN [(a)-[k:KNOWS]->(f) WHERE k.since > 2016 | f.name] AS recent_friends
+```
+
+Result:
+```text
+[{'recent_friends': ['Carol']}]
+```
+
+**Maps** — literals and key access:
+
+```cypher
+WITH {name: 'Alice', langs: ['Rust', 'Python']} AS m
+RETURN m.name AS name, m.langs[1] AS second_lang, keys(m) AS keys
+```
+
+Result:
+```text
+[{'name': 'Alice', 'second_lang': 'Python', 'keys': ['langs', 'name']}]
+```
+
+**EXISTS subquery** with a full `MATCH … RETURN` body:
+
+```cypher
+MATCH (c:Company)
+WHERE EXISTS { MATCH (c)<-[:WORKS_AT]-(p:Person) WHERE p.age > 32 RETURN p }
+RETURN c.name AS has_senior_staff
+```
+
+Result:
+```text
+[{'has_senior_staff': 'Acme'}]
+```
+
+**Parameters** `$name` can appear anywhere a value can:
+
+```cypher
+MATCH (p:Person {city: $city}) RETURN p.name AS name ORDER BY name LIMIT $limit
+```
+
+Result:
+```text
+[{'name': 'Alice'}]
+```
+
+## 2.16 Indexes: CREATE INDEX / DROP INDEX
+
+Btree indexes can also be managed in Cypher (single or composite). Fulltext
+indexes are created through the API (see [1.2](#index-management)).
+
+```cypher
+CREATE INDEX ON :Person(name)
+;
+CREATE INDEX ON :Person(city, age)
+;
+CALL db.indexes() YIELD label, property, kind RETURN * ORDER BY property
+```
+
+Result:
+```text
+[
+  {'label': 'Person', 'property': 'age', 'kind': 'btree'},
+  {'label': 'Person', 'property': 'city', 'kind': 'btree'},
+  {'label': 'Person', 'property': 'name', 'kind': 'btree'},
+]
+```
+
+```cypher
+CREATE INDEX ON :Person(name)
+;
+DROP INDEX ON :Person(name)
+;
+CALL db.indexes() YIELD label WITH label RETURN count(label) AS indexes
+```
+
+Result:
+```text
+[{'indexes': 0}]
+```
+
+## 2.17 EXPLAIN
+
+Shows the query plan instead of running the query, with estimated row counts and
+index hints.
+
+```cypher
+EXPLAIN MATCH (p:Person) WHERE p.name = 'Alice' RETURN p
+```
+
+Result:
+```text
+Project (est. 1 rows)
+  Filter (est. 1 rows)
+    (hint: no index on :Person(name); consider `db.create_index("Person", "name")` to turn this Scan+Filter into an IndexLookup)
+    Scan :Person AS p (est. 4 rows)
+```
+
+---
+
+# 3. Cypher functions
+
+Function names are case-insensitive (`toLower` = `tolower`). With almost all
+functions, a `null` argument gives `null`.
+
+## 3.1 Graph and entity functions
+
+| Function | Returns |
+|---|---|
+| `id(n)` | the internal integer id of a node (`id(r)` on a relationship returns `null`) |
+| `labels(n)` | list of the node's labels |
+| `type(r)` | the relationship's type |
+| `keys(x)` | property names of a node, relationship or map |
+| `properties(x)` | all properties as a map |
+| `startNode(r)` / `endNode(r)` | the node a relationship leaves from / points to |
+| `exists(n.prop)` | `true` if the property is set |
+| `coalesce(a, b, …)` | the first non-null argument |
+| `score(n)` | BM25 relevance for a node found through a fulltext index (see below) |
+
+```cypher
+MATCH (a:Person {name: 'Alice'})-[r:WORKS_AT]->(c)
+RETURN id(a) AS id, labels(a) AS labels, keys(a) AS keys, type(r) AS type,
+       startNode(r).name AS from, endNode(r).name AS to, properties(r) AS rel_props
+```
+
+Result:
+```text
+[
+ {'id': 1,
+  'labels': ['Person'],
+  'keys': ['age', 'city', 'email', 'name'],
+  'type': 'WORKS_AT',
+  'from': 'Alice',
+  'to': 'Acme',
+  'rel_props': {'role': 'Engineer'}}
+]
+```
+
+```cypher
+MATCH (p:Person)
+RETURN p.name AS name, exists(p.email) AS has_email,
+       coalesce(p.email, 'no email on file') AS contact
+ORDER BY name
+```
+
+Result:
+```text
+[
+  {'name': 'Alice', 'has_email': True, 'contact': 'alice@example.com'},
+  {'name': 'Bob', 'has_email': False, 'contact': 'no email on file'},
+  {'name': 'Carol', 'has_email': True, 'contact': 'carol@example.com'},
+  {'name': 'Dave', 'has_email': False, 'contact': 'no email on file'},
+]
+```
+
+`score(n)` needs a fulltext index on the property being filtered:
+
+```python
+from graphdblite import Database
+db = Database.open_memory()
+with db.begin_write() as tx:
+    tx.execute("CREATE (:Doc {t: 'graph graph graph'}), (:Doc {t: 'one graph'}), (:Doc {t: 'other'})")
+    tx.create_fulltext_index("Doc", "t")
+for row in db.query("MATCH (d:Doc) WHERE d.t CONTAINS 'graph' "
+                    "RETURN d.t AS text, score(d) AS score ORDER BY score DESC"):
+    print(row["text"], round(row["score"], 3))
+```
+
+Output:
+```text
+graph graph graph 0.0
+one graph 0.0
+```
+
+## 3.2 Type conversion
+
+| Function | Converts to | Notes |
+|---|---|---|
+| `toString(x)` | string | numbers, booleans, temporal values |
+| `toInteger(x)` | integer | floats are truncated; unparseable strings give `null` |
+| `toFloat(x)` | float | unparseable strings give `null` |
+| `toBoolean(x)` | boolean | accepts `'true'` / `'false'` (any case) |
+
+```cypher
+RETURN toString(42) AS s, toInteger('42') AS i, toInteger(3.99) AS trunc,
+       toFloat('2.5') AS f, toBoolean('TRUE') AS b, toInteger('abc') AS bad
+```
+
+Result:
+```text
+[{'s': '42', 'i': 42, 'trunc': 3, 'f': 2.5, 'b': True, 'bad': None}]
+```
+
+## 3.3 String functions
+
+| Function | Example | Result |
+|---|---|---|
+| `toLower(s)` / `toUpper(s)` | `toUpper('Hi')` | `'HI'` |
+| `trim(s)` / `lTrim(s)` / `rTrim(s)` | `trim('  x ')` | `'x'` |
+| `left(s, n)` / `right(s, n)` | `left('hello', 2)` | `'he'` |
+| `substring(s, start [, length])` | `substring('hello', 1, 3)` | `'ell'` (0-based) |
+| `replace(s, find, repl)` | `replace('a-b-c', '-', '+')` | `'a+b+c'` |
+| `split(s, sep)` | `split('a,b', ',')` | `['a', 'b']` |
+| `reverse(s)` | `reverse('abc')` | `'cba'` |
+| `size(s)` | `size('hello')` | `5` (characters) |
+
+```cypher
+WITH '  Graph Databases  ' AS s
+RETURN toUpper(trim(s)) AS upper, size(trim(s)) AS len, left(trim(s), 5) AS first5,
+       right(trim(s), 9) AS last9, substring(trim(s), 6, 4) AS sub,
+       replace(trim(s), ' ', '_') AS snake, split(trim(s), ' ') AS words,
+       reverse('abc') AS rev, lTrim('  x') AS l, rTrim('x  ') AS r
+```
+
+Result:
+```text
+[
+ {'upper': 'GRAPH DATABASES',
+  'len': 15,
+  'first5': 'Graph',
+  'last9': 'Databases',
+  'sub': 'Data',
+  'snake': 'Graph_Databases',
+  'words': ['Graph', 'Databases'],
+  'rev': 'cba',
+  'l': 'x',
+  'r': 'x'}
+]
+```
+
+Building strings:
+
+```cypher
+MATCH (p:Person) RETURN p.name + ' (' + toString(p.age) + ')' AS label ORDER BY label
+```
+
+Result:
+```text
+[
+  {'label': 'Alice (30)'},
+  {'label': 'Bob (25)'},
+  {'label': 'Carol (35)'},
+  {'label': 'Dave (40)'},
+]
+```
+
+## 3.4 List functions
+
+| Function | Returns |
+|---|---|
+| `size(list)` | number of elements |
+| `head(list)` / `last(list)` | first / last element (`null` if empty) |
+| `tail(list)` | everything except the first element |
+| `range(start, end [, step])` | integers from `start` to `end` **inclusive** |
+| `reverse(list)` | the list reversed |
+| `nodes(path)` / `relationships(path)` | the nodes / relationships of a path |
+| `length(path)` | number of relationships in a path (also works on strings and lists) |
+
+```cypher
+WITH [3, 1, 4, 1, 5] AS xs
+RETURN size(xs) AS size, head(xs) AS head, last(xs) AS last, tail(xs) AS tail,
+       reverse(xs) AS reversed, range(1, 5) AS r, range(0, 10, 5) AS stepped, range(5, 1, -2) AS down
+```
+
+Result:
+```text
+[
+ {'size': 5,
+  'head': 3,
+  'last': 5,
+  'tail': [1, 4, 1, 5],
+  'reversed': [5, 1, 4, 1, 3],
+  'r': [1, 2, 3, 4, 5],
+  'stepped': [0, 5, 10],
+  'down': [5, 3, 1]}
+]
+```
+
+```cypher
+MATCH p = (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})-[:KNOWS]->(c)
+RETURN length(p) AS hops, [n IN nodes(p) | n.name] AS names,
+       [r IN relationships(p) | r.since] AS years
+```
+
+Result:
+```text
+[{'hops': 2, 'names': ['Alice', 'Bob', 'Carol'], 'years': [2015, 2018]}]
+```
+
+## 3.5 Math functions
+
+| Function | Example | Result |
+|---|---|---|
+| `abs(x)` | `abs(-3)` | `3` |
+| `ceil(x)` / `floor(x)` | `ceil(2.1)` | `3.0` |
+| `round(x)` | `round(2.5)` | `3.0` (half away from zero) |
+| `sign(x)` | `sign(-7)` | `-1` |
+| `sqrt(x)` | `sqrt(16)` | `4.0` |
+| `exp(x)` | `exp(1)` | `2.718…` |
+| `log(x)` / `log10(x)` | `log10(1000)` | `3.0` |
+| `e()` / `pi()` | `pi()` | `3.14159…` |
+| `rand()` | `rand()` | random float in [0, 1) |
+
+```cypher
+RETURN abs(-3) AS abs, ceil(2.1) AS ceil, floor(2.9) AS floor, round(2.5) AS round,
+       round(-2.5) AS round_neg, sign(-7) AS sign, sqrt(16) AS sqrt, exp(0) AS exp,
+       log(e()) AS ln_e, log10(1000) AS log10, pi() AS pi, rand() < 1.0 AS rand_ok
+```
+
+Result:
+```text
+[
+ {'abs': 3,
+  'ceil': 3.0,
+  'floor': 2.0,
+  'round': 3.0,
+  'round_neg': -3.0,
+  'sign': -1,
+  'sqrt': 4.0,
+  'exp': 1.0,
+  'ln_e': 1.0,
+  'log10': 3.0,
+  'pi': 3.141592653589793,
+  'rand_ok': True}
+]
+```
+
+## 3.6 Aggregation functions
+
+Aggregates group rows by the non-aggregated columns in the same `RETURN` /
+`WITH`. Nulls are ignored (except by `count(*)`). `DISTINCT` works inside:
+`count(DISTINCT x)`.
+
+| Function | Returns |
+|---|---|
+| `count(*)` | number of rows |
+| `count(x)` | number of non-null values |
+| `sum(x)` / `avg(x)` | total / mean |
+| `min(x)` / `max(x)` | smallest / largest |
+| `collect(x)` | list of values |
+| `percentileDisc(x, p)` | the value at percentile `p` (0–1), picked from the data |
+| `percentileCont(x, p)` | interpolated percentile |
+| `stDev(x)` / `stDevP(x)` | sample / population standard deviation |
+
+```cypher
+MATCH (p:Person)
+RETURN count(*) AS people, count(p.email) AS with_email, sum(p.age) AS total_age,
+       avg(p.age) AS avg_age, min(p.age) AS youngest, max(p.age) AS oldest,
+       percentileDisc(p.age, 0.5) AS median_disc, percentileCont(p.age, 0.5) AS median_cont,
+       stDev(p.age) AS sd, stDevP(p.age) AS sd_pop
+```
+
+Result:
+```text
+[
+ {'people': 4,
+  'with_email': 2,
+  'total_age': 130,
+  'avg_age': 32.5,
+  'youngest': 25,
+  'oldest': 40,
+  'median_disc': 35.0,
+  'median_cont': 32.5,
+  'sd': 6.454972243679028,
+  'sd_pop': 5.5901699437494745}
+]
+```
+
+Grouping:
+
+```cypher
+MATCH (p:Person)
+RETURN p.city AS city, count(*) AS people, collect(p.name) AS names
+ORDER BY people DESC, city
+```
+
+Result:
+```text
+[
+  {'city': 'NYC', 'people': 2, 'names': ['Alice', 'Carol']},
+  {'city': 'London', 'people': 1, 'names': ['Bob']},
+  {'city': 'Paris', 'people': 1, 'names': ['Dave']},
+]
+```
+
+`DISTINCT` inside an aggregate:
+
+```cypher
+MATCH (p:Person) RETURN count(DISTINCT p.city) AS cities, collect(DISTINCT p.city) AS city_list
+```
+
+Result:
+```text
+[{'cities': 3, 'city_list': ['NYC', 'London', 'Paris']}]
+```
+
+## 3.7 List predicates: all / any / none / single
+
+`all(x IN list WHERE cond)`, `any(...)`, `none(...)`, `single(...)` (exactly one).
+
+```cypher
+WITH [2, 4, 6, 7] AS xs
+RETURN all(x IN xs WHERE x > 0) AS all_pos, any(x IN xs WHERE x > 6) AS any_big,
+       none(x IN xs WHERE x < 0) AS none_neg, single(x IN xs WHERE x % 2 = 1) AS one_odd
+```
+
+Result:
+```text
+[{'all_pos': True, 'any_big': True, 'none_neg': True, 'one_odd': True}]
+```
+
+```cypher
+MATCH p = (:Person {name: 'Alice'})-[:KNOWS*]->(:Person {name: 'Dave'})
+WHERE all(r IN relationships(p) WHERE r.since >= 2018)
+RETURN [n IN nodes(p) | n.name] AS recent_route
+```
+
+Result:
+```text
+[{'recent_route': ['Alice', 'Carol', 'Dave']}]
+```
+
+## 3.8 Temporal: dates, times, durations
+
+There are six temporal types. Each has a constructor that takes an ISO-8601 string
+or a map; with no argument it returns the current value.
+
+| Constructor | Example input | Value |
+|---|---|---|
+| `date(...)` | `'2024-03-15'`, `{year: 2024, month: 3, day: 15}` | calendar date |
+| `localtime(...)` | `'10:30:00'` | time of day, no zone |
+| `time(...)` | `'10:30+01:00'` | time with offset |
+| `localdatetime(...)` | `'2024-03-15T10:30'` | date + time, no zone |
+| `datetime(...)` | `'2024-03-15T10:30Z'`, `{…, timezone: 'America/New_York'}` | date + time + zone |
+| `duration(...)` | `'P1Y2M3DT4H'`, `{days: 3, hours: 2}` | amount of time |
+
+```cypher
+RETURN date('2024-03-15') AS d, localtime('10:30:00') AS lt, time('10:30+01:00') AS t,
+       localdatetime('2024-03-15T10:30') AS ldt, datetime('2024-03-15T10:30:00Z') AS dt,
+       duration('P1Y2M3DT4H') AS dur
+```
+
+Result:
+```text
+[
+ {'d': '2024-03-15',
+  'lt': '10:30',
+  't': '10:30+01:00',
+  'ldt': '2024-03-15T10:30',
+  'dt': '2024-03-15T10:30Z',
+  'dur': 'P1Y2M3DT4H'}
+]
+```
+
+From maps, with named time zones:
+
+```cypher
+RETURN date({year: 2024, month: 3, day: 15}) AS d,
+       datetime({year: 2024, month: 7, day: 1, hour: 9, timezone: 'America/Toronto'}) AS toronto,
+       duration({days: 3, hours: 2}) AS dur
+```
+
+Result:
+```text
+[
+ {'d': '2024-03-15',
+  'toronto': '2024-07-01T09:00-04:00[America/Toronto]',
+  'dur': 'P3DT2H'}
+]
+```
+
+**Current time.** `date()`, `datetime()` and the others accept `.transaction()`,
+`.statement()` and `.realtime()` suffixes:
+
+```cypher
+RETURN date() IS NOT NULL AS today_ok, datetime.transaction() <= datetime.realtime() AS clock_ok
+```
+
+Result:
+```text
+[{'today_ok': True, 'clock_ok': True}]
+```
+
+**Components** are read with `.field`: `year month day hour minute second
+millisecond …` on dates/times, and `years months days hours minutes seconds …` on
+durations:
+
+```cypher
+WITH datetime('2024-03-15T10:30:45Z') AS dt
+RETURN dt.year AS year, dt.month AS month, dt.day AS day, dt.hour AS hour,
+       dt.minute AS minute, dt.second AS second, duration('PT90M').minutes AS mins
+```
+
+Result:
+```text
+[{'year': 2024, 'month': 3, 'day': 15, 'hour': 10, 'minute': 30, 'second': 45, 'mins': 90}]
+```
+
+**Arithmetic and comparison:**
+
+```cypher
+RETURN date('2024-01-31') + duration('P1M') AS plus_month,
+       datetime('2024-03-15T10:00Z') - duration('PT90M') AS minus_90m,
+       date('2024-03-15') > date('2024-01-01') AS later
+```
+
+Result:
+```text
+[{'plus_month': '2024-02-29', 'minus_90m': '2024-03-15T08:30Z', 'later': True}]
+```
+
+**Epoch conversion:**
+
+| Function | Meaning |
+|---|---|
+| `datetime.fromEpoch(seconds [, nanos])` | Unix seconds → UTC datetime |
+| `datetime.fromEpochMillis(ms)` | Unix milliseconds → UTC datetime |
+
+```cypher
+RETURN datetime.fromEpoch(1700000000) AS from_seconds, datetime.fromEpochMillis(1700000000000) AS from_millis
+```
+
+Result:
+```text
+[{'from_seconds': '2023-11-14T22:13:20Z', 'from_millis': '2023-11-14T22:13:20Z'}]
+```
+
+**Differences between two temporal values:**
+
+| Function | Returns |
+|---|---|
+| `duration.between(a, b)` | full difference (months, days, time) |
+| `duration.inMonths(a, b)` | whole months only |
+| `duration.inDays(a, b)` | whole days only |
+| `duration.inSeconds(a, b)` | seconds only |
+
+```cypher
+WITH date('2024-01-15') AS a, date('2024-03-20') AS b
+RETURN duration.between(a, b) AS between, duration.inMonths(a, b) AS months,
+       duration.inDays(a, b) AS days, duration.inDays(a, b).days AS day_count
+```
+
+Result:
+```text
+[{'between': 'P2M5D', 'months': 'P2M', 'days': 'P65D', 'day_count': 65}]
+```
+
+```cypher
+RETURN duration.inSeconds(datetime('2024-01-01T00:00Z'), datetime('2024-01-01T01:00:30Z')) AS secs
+```
+
+Result:
+```text
+[{'secs': 'PT1H30S'}]
+```
+
+**Truncation** to a unit (`'year'`, `'quarter'`, `'month'`, `'week'`, `'day'`,
+`'hour'`, `'minute'`, `'second'`, …):
+
+| Function |
+|---|
+| `date.truncate(unit, value)` |
+| `localtime.truncate(unit, value)` · `time.truncate(unit, value)` |
+| `localdatetime.truncate(unit, value)` · `datetime.truncate(unit, value)` |
+
+```cypher
+RETURN date.truncate('month', date('2024-03-15')) AS month_start,
+       date.truncate('year', date('2024-03-15')) AS year_start,
+       datetime.truncate('day', datetime('2024-03-15T10:30:00Z')) AS day_start,
+       localdatetime.truncate('hour', localdatetime('2024-03-15T10:30:45')) AS hour_start,
+       localtime.truncate('hour', localtime('10:30')) AS lt_hour
+```
+
+Result:
+```text
+[
+ {'month_start': '2024-03-01',
+  'year_start': '2024-01-01',
+  'day_start': '2024-03-15T00:00Z',
+  'hour_start': '2024-03-15T10:00',
+  'lt_hour': '10:00'}
+]
+```
+
+Storing and querying dates:
+
+```cypher
+CREATE (:Event {name: 'Launch', on: date('2024-06-01')}), (:Event {name: 'Retro', on: date('2024-07-15')})
+;
+MATCH (e:Event) WHERE e.on >= date('2024-07-01') RETURN e.name AS name, e.on AS on
+```
+
+Result:
+```text
+[{'name': 'Retro', 'on': '2024-07-15'}]
+```
+
+## 3.9 Built-in procedures
+
+| Procedure | Yields | Purpose |
+|---|---|---|
+| `db.indexes()` | `label, property, kind` | list indexes (`kind`: `btree`, `fulltext`, `fulltext_ci`, `fulltext_word`) |
+| `db.counts()` | `kind, name, count` | node count per label, relationship count per type |
+| `fts.search(label, property, query)` | `node, score` | ranked word search; needs a `_word` fulltext index |
+
+```cypher
+CALL db.counts() YIELD kind, name, count RETURN kind, name, count ORDER BY kind, name
+```
+
+Result:
+```text
+[
+  {'kind': 'edge_type', 'name': 'KNOWS', 'count': 4},
+  {'kind': 'edge_type', 'name': 'WORKS_AT', 'count': 2},
+  {'kind': 'label', 'name': 'Company', 'count': 1},
+  {'kind': 'label', 'name': 'Person', 'count': 4},
+]
+```
+
+```cypher
+CREATE INDEX ON :Person(email)
+;
+CALL db.indexes() YIELD label, property, kind RETURN label, property, kind
+```
+
+Result:
+```text
+[{'label': 'Person', 'property': 'email', 'kind': 'btree'}]
+```
+
+`fts.search` uses the FTS5 query syntax: words, `"exact phrase"`, `prefix*`,
+`AND` / `OR` / `NOT`. Pass `'*'` as the property to search every column of a
+multi-property index:
+
+```python
+from graphdblite import Database
+db = Database.open_memory()
+with db.begin_write() as tx:
+    tx.execute("CREATE (:Article {title: 'Intro to Rust', body: 'ownership and borrowing'})")
+    tx.execute("CREATE (:Article {title: 'Graph tips', body: 'model relationships in Rust'})")
+    tx.create_fulltext_index_word_multi("Article", ["title", "body"])
+
+for q in ["rust", "graph OR ownership", "borrow*", '"model relationships"']:
+    rows = db.query("CALL fts.search('Article', '*', $q) YIELD node, score "
+                    "RETURN node.title AS title ORDER BY title", {"q": q})
+    print(f"{q!r:24} -> {[r['title'] for r in rows]}")
+```
+
+Output:
+```text
+'rust'                   -> ['Graph tips', 'Intro to Rust']
+'graph OR ownership'     -> ['Graph tips', 'Intro to Rust']
+'borrow*'                -> ['Intro to Rust']
+'"model relationships"'  -> ['Graph tips']
+```
+
+---
+
+# 4. Rust API
+
+Add the dependency (from your fork):
+
+```toml
+[dependencies]
+graphdblite = { git = "https://github.com/arupkamal/graphdblite.git" }
+```
+
+Public items: `Database`, `Config`, `SyncMode`, `WriteTxGuard`, `ReadTxGuard`,
+`Record`, `Value`, `Node`, `Edge`, `PathValue`, `NodeId`, `Direction`,
+`Properties`, `GraphError`, `QueryError`, `ErrorCode`, `QueryPhase`, `Span`,
+`Result`.
+
+The snippets below assume these imports and run inside a function that returns
+`Result<(), Box<dyn std::error::Error>>`:
+
+```rust
+use graphdblite::{Config, Database, Direction, GraphError, NodeId, Properties, SyncMode, Value};
+use std::collections::HashMap;
+```
+
+## 4.1 Opening a database
+
+### `Database::open(path)`, `Database::open_with_config(path, config)`, `Database::open_memory()`
+
+`open` creates the file if it's missing. `Config` controls locking, durability
+and limits. `open_memory` is for tests.
+
+```rust
+let path = std::env::temp_dir().join(format!("gdb_doc_{}.db", std::process::id()));
+let _ = std::fs::remove_file(&path);
+
+let db = Database::open(&path)?;
+drop(db);
+
+let config = Config {
+    busy_timeout_ms: 10_000,          // wait up to 10 s for another writer
+    synchronous: SyncMode::Full,      // fsync on every commit (default: Normal)
+    max_result_rows: 50_000,          // abort queries returning more rows (0 = unlimited)
+    ..Config::default()
+};
+let _db = Database::open_with_config(&path, config)?;
+
+let _mem = Database::open_memory()?;
+println!("opened {}", path.display().to_string().contains("gdb_doc_"));
+```
+
+Output:
+```text
+opened true
+```
+
+### `Config` fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `busy_timeout_ms` | `u32` | `5000` | wait time for another writer's lock |
+| `synchronous` | `SyncMode` | `Normal` | `Off`, `Normal`, `Full` or `Extra` (SQLite durability levels) |
+| `max_traversal_depth` | `u32` | `64` | max hops for variable-length patterns / shortestPath (0 = unlimited) |
+| `max_traversal_work` | `u64` | `10_000_000` | edge-visit budget per traversal (0 = unlimited) |
+| `max_property_value_bytes` | `usize` | `1 MiB` | max size of one property value (API and Cypher writes) |
+| `max_name_bytes` | `usize` | `256` | max length of labels, types and property names |
+| `max_result_rows` | `usize` | `100_000` | max rows a query may produce (0 = unlimited) |
+| `cache_size` | `i32` | `-32000` | SQLite page cache (negative = KiB, so 32 MiB) |
+| `mmap_size` | `i64` | `256 MiB` | memory-mapped I/O size (0 = off) |
+
+## 4.2 Transactions: RAII guards (recommended)
+
+### `db.write_tx()` → `WriteTxGuard`, `db.read_tx()` → `ReadTxGuard`
+
+A guard derefs to the transaction, so you call methods on it directly. Call
+`.commit()` to persist. If a guard is dropped without `commit()`, it rolls back.
+
+```rust
+let mut db = Database::open_memory()?;
+
+let tx = db.write_tx()?;
+tx.query("CREATE (:Person {name: 'Alice', age: 30})")?;
+tx.query("CREATE (:Person {name: 'Bob', age: 25})")?;
+tx.commit()?;
+
+{
+    let tx = db.write_tx()?;
+    tx.query("CREATE (:Person {name: 'Ghost'})")?;
+    // dropped without commit -> rolled back
+}
+
+let tx = db.read_tx()?;
+let rows = tx.query("MATCH (p:Person) RETURN p.name AS name ORDER BY name")?;
+for row in &rows {
+    println!("{}", row.get("name").unwrap());
+}
+tx.commit()?;
+```
+
+Output:
+```text
+"Alice"
+"Bob"
+```
+
+### `query(cypher)`, `query_with_params(cypher, Some(&params))`
+
+Available on both guards. Results are `Vec<Record>`; read a column with
+`record.get("column")`.
+
+```rust
+let mut db = Database::open_memory()?;
+let tx = db.write_tx()?;
+tx.query("UNWIND range(1, 5) AS i CREATE (:N {i: i})")?;
+let params = HashMap::from([("min".to_string(), Value::I64(3))]);
+let rows = tx.query_with_params("MATCH (n:N) WHERE n.i >= $min RETURN n.i AS i ORDER BY i", Some(&params))?;
+let values: Vec<String> = rows.iter().map(|r| r.get("i").unwrap().to_string()).collect();
+println!("{}", values.join(", "));
+tx.commit()?;
+```
+
+Output:
+```text
+3, 4, 5
+```
+
+### `commit(self)`, `rollback(self)`
+
+```rust
+let mut db = Database::open_memory()?;
+let tx = db.write_tx()?;
+tx.query("CREATE (:Temp)")?;
+tx.rollback()?;                                      // explicit, no warning
+let tx = db.read_tx()?;
+println!("{:?}", tx.query("MATCH (t:Temp) RETURN count(t) AS n")?[0].get("n"));
+tx.commit()?;
+```
+
+Output:
+```text
+Some(I64(0))
+```
+
+## 4.3 Node and edge functions (on the guards)
+
+These typed methods skip Cypher parsing. Read methods are on both guards; write
+methods are on `WriteTxGuard` only.
+
+| Method | Returns | Notes |
+|---|---|---|
+| `create_node(label, props)` | `NodeId` | `""` = no label; `Null` props are skipped |
+| `create_node_with_labels(&[labels], props)` | `NodeId` | several labels |
+| `get_node(id)` | `Node` | `GraphError::NodeNotFound` if missing |
+| `node_exists(id)` | `bool` | |
+| `set_node_property(id, key, value)` | `()` | `Value::Null` removes the property |
+| `remove_node_property(id, key)` | `()` | |
+| `delete_node(id)` | `()` | also deletes the node's relationships |
+| `create_edge(src, dst, type, props)` | `()` | both nodes must exist |
+| `delete_edge(src, dst, type)` | `()` | removes **all** parallel `src-type->dst` edges |
+| `get_edge_properties(src, dst, type)` | `Properties` | of the first such edge |
+| `get_neighbors(id, type, Direction)` | `Vec<NodeId>` | `Outgoing`, `Incoming`, `Both` |
+| `find_nodes_by_label(label)` | `Vec<Node>` | exact, case-sensitive |
+| `index_lookup(label, property, &value)` | `Vec<NodeId>` | requires an index on `(label, property)` |
+| `traverse(start, type, Direction, min, max)` | `Vec<NodeId>` | distinct nodes reachable in min..=max hops |
+| `traverse_with_depth(start, type, Direction, min, max)` | `Vec<(NodeId, u32)>` | same, with hop count, nearest first |
+
+```rust
+let mut db = Database::open_memory()?;
+let tx = db.write_tx()?;
+
+let alice = tx.create_node("Person", HashMap::from([
+    ("name".to_string(), Value::String("Alice".into())),
+    ("age".to_string(), Value::I64(30)),
+]))?;
+let bob = tx.create_node_with_labels(
+    &["Person".to_string(), "Admin".to_string()],
+    HashMap::from([("name".to_string(), Value::String("Bob".into()))]),
+)?;
+let carol = tx.create_node("Person", HashMap::from([("name".to_string(), Value::String("Carol".into()))]))?;
+
+tx.create_edge(alice, bob, "KNOWS", HashMap::from([("since".to_string(), Value::I64(2020))]))?;
+tx.create_edge(bob, carol, "KNOWS", HashMap::new())?;
+
+tx.set_node_property(alice, "city", Value::String("NYC".into()))?;
+tx.remove_node_property(alice, "age")?;
+
+let a = tx.get_node(alice)?;
+println!("labels={:?} name={} city={}", a.labels, a.properties["name"], a.properties["city"]);
+println!("bob exists: {}", tx.node_exists(bob)?);
+println!("edge props: {:?}", tx.get_edge_properties(alice, bob, "KNOWS")?);
+println!("alice -> {:?}", tx.get_neighbors(alice, "KNOWS", Direction::Outgoing)?);
+println!("bob <-> {:?}", tx.get_neighbors(bob, "KNOWS", Direction::Both)?);
+println!("2 hops from alice: {:?}", tx.traverse(alice, "KNOWS", Direction::Outgoing, 2, 2)?);
+println!("with depth: {:?}", tx.traverse_with_depth(alice, "KNOWS", Direction::Outgoing, 1, 3)?);
+println!("admins: {}", tx.find_nodes_by_label("Admin")?.len());
+
+tx.create_index("Person", "name")?;
+println!("lookup Carol: {:?}", tx.index_lookup("Person", "name", &Value::String("Carol".into()))?);
+
+tx.delete_edge(bob, carol, "KNOWS")?;
+tx.delete_node(carol)?;
+println!("carol exists: {}", tx.node_exists(carol)?);
+tx.commit()?;
+```
+
+Output:
+```text
+labels=["Person"] name="Alice" city="NYC"
+bob exists: true
+edge props: {"since": I64(2020)}
+alice -> [NodeId(2)]
+bob <-> [NodeId(3), NodeId(1)]
+2 hops from alice: [NodeId(3)]
+with depth: [(NodeId(2), 1), (NodeId(3), 2)]
+admins: 1
+lookup Carol: [NodeId(3)]
+carol exists: false
+```
+
+## 4.4 Index functions (on `WriteTxGuard`)
+
+| Method | Purpose |
+|---|---|
+| `create_index(label, prop)` / `drop_index(label, prop)` | btree index for `=` lookups |
+| `create_composite_index(label, &[props])` / `drop_composite_index(label, &[props])` | multi-property btree index |
+| `create_fulltext_index(label, prop)` | trigram index for `CONTAINS` / `STARTS WITH` / `ENDS WITH` |
+| `create_fulltext_index_ci(label, prop)` | case-insensitive trigram (`toLower(...)` idiom) |
+| `create_fulltext_index_word(label, prop)` | word index for `fts.search` |
+| `create_fulltext_index_word_multi(label, &[props as String])` | multi-column word index |
+| `drop_fulltext_index(label, prop)` | drop a fulltext index |
+
+```rust
+let mut db = Database::open_memory()?;
+let tx = db.write_tx()?;
+tx.query("CREATE (:Doc {id: 1, lang: 'en', body: 'Graph databases are fun'})")?;
+tx.create_index("Doc", "id")?;
+tx.create_composite_index("Doc", &["lang", "id"])?;
+tx.create_fulltext_index("Doc", "body")?;
+for r in tx.query("CALL db.indexes() YIELD label, property, kind RETURN * ORDER BY kind, property")? {
+    println!("{} {} {}", r.get("label").unwrap(), r.get("property").unwrap(), r.get("kind").unwrap());
+}
+tx.drop_index("Doc", "id")?;
+tx.drop_composite_index("Doc", &["lang", "id"])?;
+tx.drop_fulltext_index("Doc", "body")?;
+tx.commit()?;
+```
+
+Output:
+```text
+"Doc" "id" "btree"
+"Doc" "id" "btree"
+"Doc" "lang" "btree"
+"Doc" "body" "fulltext"
+```
+
+## 4.5 Stateful API (used by the language bindings)
+
+`begin_write()` / `begin_read()` / `execute()` / `execute_with_params()` /
+`commit()` / `rollback()`, plus the index methods directly on `Database`. Outside
+a transaction, `execute` auto-commits each statement. Don't mix this style with
+guards on the same handle.
+
+```rust
+let mut db = Database::open_memory()?;
+db.execute("CREATE (:Counter {n: 0})")?;                  // auto-commit
+
+db.begin_write()?;
+db.execute("MATCH (c:Counter) SET c.n = c.n + 1")?;
+db.create_index("Counter", "n")?;
+db.commit()?;
+
+db.begin_write()?;
+db.execute("MATCH (c:Counter) SET c.n = 100")?;
+db.rollback()?;
+
+let params = HashMap::from([("x".to_string(), Value::I64(1))]);
+let rows = db.execute_with_params("MATCH (c:Counter) WHERE c.n = $x RETURN c.n AS n", Some(&params))?;
+println!("{:?}", rows[0].get("n"));
+```
+
+Output:
+```text
+Some(I64(1))
+```
+
+### `db.snapshot_to(path)`
+
+```rust
+let mut db = Database::open_memory()?;
+db.execute("CREATE (:X {v: 42})")?;
+let out = std::env::temp_dir().join(format!("gdb_snap_{}.db", std::process::id()));
+let _ = std::fs::remove_file(&out);
+db.snapshot_to(&out)?;
+let mut copy = Database::open(&out)?;
+println!("{:?}", copy.execute("MATCH (x:X) RETURN x.v AS v")?[0].get("v"));
+```
+
+Output:
+```text
+Some(I64(42))
+```
+
+## 4.6 Records and values
+
+`Record` methods: `get(key) -> Option<&Value>`, `iter()`, `keys()`, `values()`,
+`len()`, `is_empty()`. `Value` is an enum: `Null`, `Bool`, `I64`, `F64`,
+`String`, `List`, `Map`, `Node`, `Edge`, `Path`, `Date`, `LocalTime`, `Time`,
+`LocalDateTime`, `DateTime`, `Duration`. It implements `Display` (Cypher-style
+output, so strings print with quotes; match `Value::String(s)` for the raw text)
+and `PartialEq`.
+
+```rust
+let mut db = Database::open_memory()?;
+db.execute("CREATE (:Person {name: 'Alice', tags: ['a', 'b']})-[:KNOWS {since: 2020}]->(:Person {name: 'Bob'})")?;
+let rows = db.execute("MATCH p = (a:Person)-[r:KNOWS]->(b) RETURN a, r, p, a.tags AS tags, date('2024-03-15') AS d")?;
+let row = &rows[0];
+println!("columns: {:?}", row.keys().collect::<Vec<_>>());
+
+if let Some(Value::Node(n)) = row.get("a") {
+    println!("node id={} labels={:?} name={}", n.id.0, n.labels, n.properties["name"]);
+}
+if let Some(Value::Edge(e)) = row.get("r") {
+    println!("edge {} -[{}]-> {} since={}", e.src.0, e.label, e.dst.0, e.properties["since"]);
+}
+if let Some(Value::Path(p)) = row.get("p") {
+    println!("path length={} nodes={}", p.len(), p.nodes.len());
+}
+match row.get("tags") {
+    Some(Value::List(items)) => println!("tags: {}", items.len()),
+    _ => {}
+}
+println!("date: {}", row.get("d").unwrap());
+```
+
+Output:
+```text
+columns: ["a", "r", "p", "tags", "d"]
+node id=1 labels=["Person"] name="Alice"
+edge 1 -[KNOWS]-> 2 since=2020
+path length=1 nodes=2
+tags: 2
+date: 2024-03-15
+```
+
+## 4.7 Errors
+
+All functions return `graphdblite::Result<T>` = `Result<T, GraphError>`.
+`GraphError` variants include `Query(QueryError)` (with `.kind()`, `.code()`,
+`.message()`, `.hint()`, `.phase()`, `.span()`), `Storage`, `NodeNotFound`,
+`EdgeNotFound`, `Transaction`, `IndexAlreadyExists`, `IndexNotFound`,
+`InvalidName`, `SizeLimit` and `SchemaMismatch`.
+
+```rust
+let mut db = Database::open_memory()?;
+match db.execute("MATCH (n RETURN n") {
+    Err(GraphError::Query(q)) => println!("{} / {:?}", q.kind(), q.code()),
+    other => println!("unexpected: {other:?}"),
+}
+match db.execute("RETURN toUpperr('x')") {
+    Err(GraphError::Query(q)) => println!("{} hint={:?}", q.kind(), q.hint()),
+    other => println!("unexpected: {other:?}"),
+}
+let tx = db.read_tx()?;
+match tx.get_node(NodeId(999)) {
+    Err(GraphError::NodeNotFound { id, .. }) => println!("missing {id}"),
+    other => println!("unexpected: {other:?}"),
+}
+tx.commit()?;
+let tx = db.write_tx()?;
+tx.create_index("P", "x")?;
+match tx.create_index("P", "x") {
+    Err(e @ GraphError::IndexAlreadyExists { .. }) => println!("{e}"),
+    other => println!("unexpected: {other:?}"),
+}
+tx.commit()?;
+```
+
+Output:
+```text
+SyntaxError / UnexpectedSyntax
+SyntaxError hint=Some("did you mean `toupper()`?")
+missing NodeId(999)
+index already exists: :P(x)
+```
+
+## 4.8 Types reference
+
+| Type | Definition |
+|---|---|
+| `NodeId` | `pub struct NodeId(pub u64)`, printed as `NodeId(n)` |
+| `Node` | `{ id: NodeId, labels: Vec<String>, properties: Properties }` |
+| `Edge` | `{ src: NodeId, dst: NodeId, label: String, properties: Properties }` |
+| `PathValue` | `{ nodes: Vec<Node>, edges: Vec<Edge> }`, plus `len()`, `is_empty()` and `PathValue::single(node)` |
+| `Properties` | `HashMap<String, Value>` |
+| `Direction` | `Outgoing`, `Incoming`, `Both` |
+| `SyncMode` | `Off`, `Normal`, `Full`, `Extra` |
+| `Record` | one result row (see 4.6) |
+
+
+---
+
+# Appendix: limits and gotchas
+
+Things that behave differently from Neo4j or might surprise you. All of them
+were confirmed against this build.
+
+| Topic | Behaviour | What to do |
+|---|---|---|
+| Filtering procedure output | `CALL … YIELD x WHERE …` is a syntax error | `CALL … YIELD x WITH x WHERE … RETURN …` |
+| Counting procedure rows | `CALL … YIELD x RETURN count(*)` returns **no row** when the procedure yields nothing | `CALL … YIELD x WITH x RETURN count(x)` returns `0` |
+| `id()` on relationships | returns `null` | identify edges by `startNode(r)`, `endNode(r)`, `type(r)` and properties |
+| `shortestPath` with no path | returns a row with `p = null` (Neo4j returns no row) | add `WHERE p IS NOT NULL` |
+| Case-insensitive text search | plain `CONTAINS` / `STARTS WITH` / `ENDS WITH` are case-sensitive, even with a `_ci` index | use `toLower(n.p) CONTAINS toLower($q)` |
+| Not implemented | `CALL { … }` subqueries, `reduce()`, map projections (`n {.name}`), `db.labels()` / `db.relationshipTypes()` / `db.propertyKeys()`, `FOREACH`, `LOAD CSV` | use `UNWIND`, list comprehensions and `WITH` |
+| Deleting one of several parallel edges via a list | `WITH collect(r) AS rs DELETE rs[0]` deletes **all** edges of that type between those two nodes | delete through the matched variable: `MATCH (a)-[r:T]->(b) WHERE r.k = … DELETE r` |
+| Standalone relationship `MERGE` | `MERGE (a:A {id: 1})-[:R]->(b:B {id: 2})` reuses existing `a` / `b` nodes one at a time (Neo4j matches the whole pattern) | `MERGE` the nodes first, then `MERGE (a)-[:R]->(b)` |
+| Result size | queries stop with an error after `max_result_rows` (default 100,000) | add `LIMIT`, page with `SKIP`, or raise the limit in `Config` (Rust) |
+| Traversal depth | `*` and `shortestPath` are capped at 64 hops by default | `Config::max_traversal_depth` (Rust) |
+| Property values | maps (and lists of maps) can't be stored; values over 1 MiB and names over 256 bytes are rejected | store nested data as separate nodes, or as a JSON string |
+| Python `query()` | read-only: writes raise `GraphDBError` | use `execute()` or `begin_write()` |
+| Python error classes | almost every query error is a `ParseError`, including runtime type errors | catch `GraphDBError` |
+| Threads | a `Database` handle is single-threaded | one handle per thread (several handles and processes can share a file) |
+
