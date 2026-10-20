@@ -1276,8 +1276,14 @@ pub fn validate_name(name: &str) -> Result<()> {
 /// Validate name length against a configured maximum.
 pub fn validate_name_length(name: &str, max_bytes: usize) -> Result<()> {
     if name.len() > max_bytes {
+        // Truncate the preview on a char boundary: slicing at a raw byte
+        // offset panics for multi-byte UTF-8 names.
+        let mut cut = max_bytes.min(32);
+        while !name.is_char_boundary(cut) {
+            cut -= 1;
+        }
         return Err(GraphError::SizeLimit {
-            what: format!("name '{}...'", &name[..max_bytes.min(32)]),
+            what: format!("name '{}...'", &name[..cut]),
             limit: max_bytes,
             actual: name.len(),
             hint: None,

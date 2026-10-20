@@ -136,7 +136,9 @@ Each binding additionally exposes a case-insensitive variant —
 `graphdb_create_fulltext_index_ci` (C/FFI). Behaviour mirrors the
 case-sensitive variant except the FTS5 tokenizer is built with
 `case_sensitive 0`, and the planner also rewrites the symmetric
-`toLower(prop) <op> toLower(rhs)` idiom against a CI index. The
+`toLower(prop) <op> toLower(rhs)` idiom against a CI index (results are
+always identical to an unindexed scan — plain predicates stay
+case-sensitive). The
 `db.indexes()` procedure reports `kind = "fulltext_ci"` for CI
 indexes.
 

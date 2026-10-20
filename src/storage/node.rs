@@ -235,7 +235,11 @@ pub fn find_nodes_by_label(conn: &Connection, label: &str) -> Result<Vec<Node>> 
         )
     } else {
         (
-            "SELECT key, value FROM nodes WHERE label = ?1 OR ':' || label || ':' LIKE '%:' || ?1 || ':%' ORDER BY key".to_string(),
+            // `instr` is an exact, case-sensitive substring test. `LIKE` must
+            // not be used here: it is ASCII case-insensitive and treats `_`
+            // (legal in labels) as a single-character wildcard, so
+            // `:person` / `:A_B` would match `Person` / `AxB` nodes.
+            "SELECT key, value FROM nodes WHERE label = ?1 OR instr(':' || label || ':', ':' || ?1 || ':') > 0 ORDER BY key".to_string(),
             true,
         )
     };

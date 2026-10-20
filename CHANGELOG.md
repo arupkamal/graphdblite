@@ -7,6 +7,42 @@ ships.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Label scans are exact.** `MATCH (n:person)` no longer returns `:Person`
+  nodes and `:A_B` no longer matches `:AxB` (the scan used SQL `LIKE`, which
+  is ASCII case-insensitive and treats `_` as a wildcard). Also affected
+  index/fulltext backfills, MERGE matching and `find_nodes_by_label`.
+- **Index lookups keep every label.** `MATCH (n:A:B {x: 1})` served by an
+  index on `:A(x)` now requires `:B` as well.
+- **Index lookups use Cypher equality.** `{x: 1}` matches a stored `1.0` (and
+  vice versa) exactly as an unindexed scan does; `{x: null}` never matches.
+- **shortestPath / allShortestPaths** now work without a relationship type
+  (`[*]`), honour every type in `[:A|B*]`, and scan endpoints that are first
+  introduced inside the shortestPath pattern.
+- **MERGE** honours relationship direction (`<-[:R]-`, undirected), keeps all
+  labels when it follows another clause or creates relationship endpoints,
+  and applies `ON CREATE SET` to the newly created parallel edge.
+- **Variable-length relationship property maps** (`[:R*1..3 {w: $w}]`) no
+  longer drop non-literal values.
+- **DELETE / SET / REMOVE on a plain value** (e.g. `WITH n.k AS x DELETE x`)
+  is a type error instead of acting on the node whose id equals the value.
+- **Fulltext lookups** re-check every candidate with the exact predicate:
+  the `toLower(...)` idiom works for `STARTS WITH`, `ENDS WITH` and short
+  terms, and plain predicates stay case-sensitive even on a
+  case-insensitive index (behaviour change: previously a plain `CONTAINS`
+  became case-insensitive when a `fulltext_ci` index existed).
+- **Plan cache** is keyed on SQLite's schema cookie, so plans cached before a
+  rolled-back `CREATE INDEX` or a `DROP INDEX` from another handle/process are
+  not reused.
+- **Setting a property to null** through MERGE or
+  `WriteTransaction::set_node_property` no longer writes a Null index entry.
+- **Name-length errors** no longer panic on multi-byte UTF-8 names.
+- **Cypher writes validate properties**: maps (and lists of maps) are rejected
+  in `CREATE`, `MERGE`, `ON CREATE/ON MATCH SET` and `SET n = / += map`, and
+  `Config::max_property_value_bytes` / `max_name_bytes` are enforced for
+  Cypher writes, not only the typed API.
+
 ## [0.1.2] - 2026-07-08
 
 ### Added

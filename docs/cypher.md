@@ -445,6 +445,11 @@ index and rewrites matching predicates to use it.
 **Semantics:**
 
 - **Case-sensitive.** Matches the openCypher spec exactly.
+- **Case-insensitive indexes** (`create_fulltext_index_ci`) also serve the
+  `toLower(n.prop) <op> toLower(<term>)` idiom. An index never changes
+  results: a plain `CONTAINS` / `STARTS WITH` / `ENDS WITH` served by a CI
+  index is still evaluated case-sensitively (FTS rows are candidates that
+  are re-checked with the exact predicate).
 - **String properties only.** Non-string values for an indexed
   property are silently skipped at index-write time.
 - **Term-length floor.** Search terms shorter than 3 codepoints

@@ -11,9 +11,7 @@ use rusqlite::Connection;
 
 use crate::cypher::ast::{Expr, ExprKind, ReturnItem};
 use crate::cypher::eval::{eval_expr, eval_predicate, expr_to_column_name};
-use crate::cypher::executor::{
-    index_lookup_ids, is_user_visible_field, literal_to_value, node_to_record,
-};
+use crate::cypher::executor::{index_lookup_ids, is_user_visible_field, node_to_record};
 use crate::cypher::ir::*;
 use crate::cypher::record::NamedRecord;
 use crate::node;
@@ -272,7 +270,9 @@ pub struct ExpandIter<'a> {
     min_hops: u32,
     max_hops: u32,
     var_length: bool,
-    var_length_prop_filters: HashMap<String, Value>,
+    /// Relationship property constraints of a var-length pattern, evaluated
+    /// per input row (they may reference parameters and row variables).
+    var_length_prop_filters: HashMap<String, crate::cypher::ast::Expr>,
     max_traversal_work: u64,
     /// Buffer of expanded records from the current input record.
     buffer: std::vec::IntoIter<NamedRecord>,
@@ -294,7 +294,7 @@ impl<'a> ExpandIter<'a> {
         min_hops: u32,
         max_hops: u32,
         var_length: bool,
-        var_length_prop_filters: HashMap<String, Value>,
+        var_length_prop_filters: HashMap<String, crate::cypher::ast::Expr>,
         max_traversal_work: u64,
     ) -> Self {
         Self {
@@ -333,6 +333,11 @@ impl<'a> RecordIter for ExpandIter<'a> {
             // matches `exec_expand`'s semantics on every shape — including
             // untyped relationships, `Direction::Both` parallel edges, and
             // the `__edge_seq` binding for relationship uniqueness.
+            let prop_filter_values = crate::cypher::executor::eval_var_length_prop_filters(
+                self.conn,
+                &self.var_length_prop_filters,
+                &rec,
+            )?;
             let expanded = crate::cypher::executor::expand_record(
                 self.conn,
                 &rec,
@@ -344,7 +349,7 @@ impl<'a> RecordIter for ExpandIter<'a> {
                 self.min_hops,
                 self.max_hops,
                 self.var_length,
-                &self.var_length_prop_filters,
+                &prop_filter_values,
                 None,
                 self.max_traversal_work,
             )?;
@@ -387,6 +392,11 @@ pub fn build_iter<'a>(
             let mut records = Vec::new();
             for id in node_ids {
                 let n = node::get_node(conn, id)?;
+                // Only emit nodes that carry the queried label (mirrors
+                // `exec_index_lookup`).
+                if !label.is_empty() && !n.labels.iter().any(|l| l == label) {
+                    continue;
+                }
                 let rec = node_to_record(&n, alias);
                 if let Some(filter) = remaining_filters {
                     if !eval_predicate(filter, &rec, crate::cypher::eval::EvalCx::new(conn))? {
@@ -451,13 +461,7 @@ pub fn build_iter<'a>(
             result_cap: _,
         } => {
             let input_iter = build_iter(conn, input, max_traversal_work)?;
-            let prop_filter_values: HashMap<String, Value> = var_length_prop_filters
-                .iter()
-                .filter_map(|(k, expr)| match &expr.kind {
-                    ExprKind::Literal(lit) => Some((k.clone(), literal_to_value(lit))),
-                    _ => None,
-                })
-                .collect();
+            let prop_filter_values = var_length_prop_filters.clone();
             Ok(Box::new(ExpandIter {
                 input: input_iter,
                 conn,
@@ -520,6 +524,7 @@ pub fn build_iter<'a>(
             property,
             op,
             term,
+            case_insensitive,
             remaining_filters,
         } => {
             use crate::cypher::executor::exec_fulltext_lookup;
@@ -529,6 +534,7 @@ pub fn build_iter<'a>(
                 alias,
                 property,
                 *op,
+                *case_insensitive,
                 term,
                 remaining_filters.as_ref(),
                 &NamedRecord::new(),

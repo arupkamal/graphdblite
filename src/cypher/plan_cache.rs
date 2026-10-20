@@ -38,6 +38,11 @@ const DEFAULT_CAPACITY: usize = 128;
 struct Key {
     cypher: String,
     epoch: u64,
+    /// SQLite's `PRAGMA schema_version` as seen by the planning connection.
+    /// The in-process `epoch` alone misses schema changes made by other
+    /// handles/processes and schema changes undone by a rollback (the epoch
+    /// was bumped by the DDL but the tables are gone again).
+    schema_cookie: i64,
 }
 
 pub(crate) struct PlanCache {
@@ -68,13 +73,30 @@ impl PlanCache {
     /// Resolve `cypher` at the given `epoch` to a planned [`LogicalOp`],
     /// reusing a cached plan when available. On a miss, calls `build` to
     /// produce the plan and inserts it. Errors from `build` are not cached.
+    #[cfg(test)]
     pub(crate) fn get_or_plan<F>(&self, cypher: &str, epoch: u64, build: F) -> Result<LogicalOp>
+    where
+        F: FnOnce() -> Result<LogicalOp>,
+    {
+        self.get_or_plan_with_schema(cypher, epoch, 0, build)
+    }
+
+    /// Like `get_or_plan`, additionally keyed on the connection's current
+    /// schema cookie (see [`schema_cookie`]).
+    pub(crate) fn get_or_plan_with_schema<F>(
+        &self,
+        cypher: &str,
+        epoch: u64,
+        schema_cookie: i64,
+        build: F,
+    ) -> Result<LogicalOp>
     where
         F: FnOnce() -> Result<LogicalOp>,
     {
         let key = Key {
             cypher: cypher.to_string(),
             epoch,
+            schema_cookie,
         };
 
         // Fast path: hit. Clone the cached plan under the lock; the planner
@@ -108,6 +130,15 @@ impl PlanCache {
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().map(|g| g.map.len()).unwrap_or(0)
     }
+}
+
+/// SQLite's schema cookie (`PRAGMA schema_version`) for `conn`. It changes on
+/// every committed schema change from any connection and is restored by a
+/// rollback, so it pins a cached plan to the exact schema it was planned
+/// against. Inside a transaction it reflects that transaction's view.
+pub(crate) fn schema_cookie(conn: &rusqlite::Connection) -> Result<i64> {
+    let mut stmt = conn.prepare_cached("PRAGMA schema_version")?;
+    Ok(stmt.query_row([], |r| r.get::<_, i64>(0))?)
 }
 
 impl Default for PlanCache {

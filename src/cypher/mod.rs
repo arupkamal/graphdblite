@@ -62,7 +62,8 @@ pub(crate) fn execute_cypher(
     let plan = match (caches.plan, caches.schema_epoch) {
         (Some(pc), Some(epoch)) if plan_cache::is_plan_cacheable(&stmt) => {
             let e = epoch.load(Ordering::Acquire);
-            pc.get_or_plan(cypher, e, || {
+            let cookie = plan_cache::schema_cookie(conn)?;
+            pc.get_or_plan_with_schema(cypher, e, cookie, || {
                 planner::plan_with_procedures(conn, &stmt, &ctx.procedures, params)
             })?
         }

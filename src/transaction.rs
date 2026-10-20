@@ -99,11 +99,14 @@ macro_rules! impl_read_ops {
                 cypher: &str,
                 params: Option<&std::collections::HashMap<String, Value>>,
             ) -> Result<Vec<NamedRecord>> {
+                let (max_property_value_bytes, max_name_bytes) = self.write_limits();
                 let ctx = ExecContext {
                     max_result_rows: self.max_result_rows,
                     max_traversal_depth: self.max_traversal_depth,
                     max_traversal_work: self.max_traversal_work,
                     require_read_only: $read_only,
+                    max_property_value_bytes,
+                    max_name_bytes,
                     ..Default::default()
                 };
                 execute_cypher(&self.tx, cypher, params, ctx, self.exec_caches())
@@ -116,12 +119,15 @@ macro_rules! impl_read_ops {
                 params: Option<&std::collections::HashMap<String, Value>>,
                 procedures: &crate::cypher::procedure::ProcedureRegistry,
             ) -> Result<Vec<NamedRecord>> {
+                let (max_property_value_bytes, max_name_bytes) = self.write_limits();
                 let ctx = ExecContext {
                     max_result_rows: self.max_result_rows,
                     max_traversal_depth: self.max_traversal_depth,
                     max_traversal_work: self.max_traversal_work,
                     procedures: procedures.clone(),
                     require_read_only: $read_only,
+                    max_property_value_bytes,
+                    max_name_bytes,
                     ..Default::default()
                 };
                 execute_cypher(&self.tx, cypher, params, ctx, self.exec_caches())
@@ -185,6 +191,13 @@ impl<'a> ReadTransaction<'a> {
     pub fn rollback(self) -> Result<()> {
         self.tx.rollback()?;
         Ok(())
+    }
+}
+
+impl ReadTransaction<'_> {
+    /// Read transactions cannot write, so no write limits apply.
+    fn write_limits(&self) -> (usize, usize) {
+        (0, 0)
     }
 }
 
@@ -266,6 +279,10 @@ impl<'a> WriteTransaction<'a> {
             self.max_name_bytes,
             self.max_property_value_bytes,
         )?;
+        // A Null-valued property is the same as an absent one (matches Cypher
+        // `CREATE`, which skips nulls); storing it would also index a Null.
+        let mut properties = properties;
+        properties.retain(|_, v| *v != Value::Null);
         let id = node::create_node(&self.tx, labels, properties.clone())?;
         index::update_indexes_for_node(&self.tx, id, labels, None, &properties)?;
         fts::update_fts_for_node(&self.tx, id, labels, None, &properties)?;
@@ -292,7 +309,13 @@ impl<'a> WriteTransaction<'a> {
         let old = node::get_node(&self.tx, id)?;
         node::set_node_property(&self.tx, id, key, value.clone())?;
         let mut new_props = old.properties.clone();
-        new_props.insert(key.to_string(), value);
+        // Setting a property to Null removes it (as `node::set_node_property`
+        // does on disk); never index a Null value.
+        if value == Value::Null {
+            new_props.remove(key);
+        } else {
+            new_props.insert(key.to_string(), value);
+        }
         index::update_indexes_for_node(
             &self.tx,
             id,
@@ -348,7 +371,8 @@ impl<'a> WriteTransaction<'a> {
                 hint: None,
             });
         }
-        edge::create_edge(&self.tx, src, dst, label, properties)
+        edge::create_edge(&self.tx, src, dst, label, properties)?;
+        Ok(())
     }
 
     /// Delete an edge.
@@ -438,6 +462,13 @@ impl<'a> WriteTransaction<'a> {
     pub fn rollback(self) -> Result<()> {
         self.tx.rollback()?;
         Ok(())
+    }
+}
+
+impl WriteTransaction<'_> {
+    /// `(max_property_value_bytes, max_name_bytes)` enforced on Cypher writes.
+    fn write_limits(&self) -> (usize, usize) {
+        (self.max_property_value_bytes, self.max_name_bytes)
     }
 }
 
@@ -694,12 +725,20 @@ mod tx_guard_tests {
             tx.commit().unwrap();
         }
         {
-            // Case-insensitive: lowercase substring matches mixed-case content.
+            // The CI index serves the `toLower` idiom across case...
             let tx = db.read_tx().unwrap();
+            let rows = tx
+                .query(
+                    "MATCH (n:Doc) WHERE toLower(n.body) CONTAINS toLower('HELLO') \
+                     RETURN n.body AS body",
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            // ...while a plain CONTAINS keeps Cypher's case-sensitive semantics.
             let rows = tx
                 .query("MATCH (n:Doc) WHERE n.body CONTAINS 'hello' RETURN n.body AS body")
                 .unwrap();
-            assert_eq!(rows.len(), 1);
+            assert_eq!(rows.len(), 0);
         }
         {
             let tx = db.write_tx().unwrap();

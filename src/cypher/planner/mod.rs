@@ -234,6 +234,7 @@ pub(in crate::cypher::planner) fn rewrite_text_filter_to_fts(
                         property: prop,
                         op: fts_op,
                         term,
+                        case_insensitive: needs_ci,
                         remaining_filters: residual,
                     };
                     return;
@@ -274,6 +275,7 @@ pub(in crate::cypher::planner) fn rewrite_text_filter_to_fts(
                             property: prop,
                             op: fts_op,
                             term,
+                            case_insensitive: needs_ci,
                             remaining_filters: residual,
                         };
                         *op = LogicalOp::CorrelatedJoin {
@@ -312,8 +314,9 @@ fn fts_kind_for(conn: &Connection, label: &str, property: &str) -> Option<FtsKin
 
 /// Whether an FTS rewrite is safe given the index kind and whether the
 /// matched predicate needs case-insensitive semantics. Case-insensitive
-/// predicates require a CI index; case-sensitive predicates work with
-/// either kind.
+/// predicates require a CI index (a case-sensitive one would miss
+/// candidates); case-sensitive predicates work with either kind because the
+/// executor re-checks every candidate with the exact predicate.
 fn fts_rewrite_is_usable(conn: &Connection, label: &str, property: &str, needs_ci: bool) -> bool {
     match fts_kind_for(conn, label, property) {
         Some(FtsKind::CaseInsensitive) => true,
@@ -404,6 +407,7 @@ fn try_rewrite_or_chain_to_union(
             property: prop,
             op: fts_op,
             term,
+            case_insensitive: needs_ci,
             remaining_filters: None,
         });
     }

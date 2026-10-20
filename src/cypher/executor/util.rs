@@ -173,6 +173,9 @@ pub fn execute_first_match(
             let node_ids = index_lookup_ids(conn, label, index_properties, lookups)?;
             for id in node_ids {
                 let n = node::get_node(conn, id)?;
+                if !label.is_empty() && !n.labels.iter().any(|l| l == label) {
+                    continue;
+                }
                 let rec = node_to_record(&n, alias);
                 if let Some(filter) = remaining_filters {
                     if !eval_predicate(filter, &rec, crate::cypher::eval::EvalCx::new(conn))? {

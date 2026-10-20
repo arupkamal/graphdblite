@@ -330,6 +330,8 @@ impl Database {
                 max_traversal_depth: self.max_traversal_depth,
                 max_traversal_work: self.max_traversal_work,
                 require_read_only: self.tx_state == TxState::Read,
+                max_property_value_bytes: self.max_property_value_bytes,
+                max_name_bytes: self.max_name_bytes,
                 ..Default::default()
             };
             return execute_cypher(&self.conn, cypher, params, ctx, self.exec_caches());
@@ -350,16 +352,24 @@ impl Database {
             max_result_rows: self.max_result_rows,
             max_traversal_depth: self.max_traversal_depth,
             max_traversal_work: self.max_traversal_work,
+            max_property_value_bytes: self.max_property_value_bytes,
+            max_name_bytes: self.max_name_bytes,
             ..Default::default()
         };
-        let plan = if plan_cache::is_plan_cacheable(&stmt) {
-            let epoch = self.schema_epoch.load(Ordering::Acquire);
-            self.plan_cache.get_or_plan(cypher, epoch, || {
+        let cacheable = plan_cache::is_plan_cacheable(&stmt);
+        let plan_for = |cookie: i64| -> Result<crate::cypher::ir::LogicalOp> {
+            if cacheable {
+                let epoch = self.schema_epoch.load(Ordering::Acquire);
+                self.plan_cache
+                    .get_or_plan_with_schema(cypher, epoch, cookie, || {
+                        planner::plan_with_procedures(&self.conn, &stmt, &ctx.procedures, params)
+                    })
+            } else {
                 planner::plan_with_procedures(&self.conn, &stmt, &ctx.procedures, params)
-            })?
-        } else {
-            planner::plan_with_procedures(&self.conn, &stmt, &ctx.procedures, params)?
+            }
         };
+        let planned_cookie = plan_cache::schema_cookie(&self.conn)?;
+        let mut plan = plan_for(planned_cookie)?;
         if matches!(stmt, ast::Statement::Explain(_)) {
             return Ok(crate::cypher::cost::format_explain(&self.conn, &plan));
         }
@@ -376,10 +386,21 @@ impl Database {
             self.conn.execute_batch("BEGIN IMMEDIATE")?;
             self.tx_state = TxState::Write;
         }
-        let result = executor::execute_with_ctx(&self.conn, &plan, &ctx);
+        // Planning ran before BEGIN; if another connection changed the schema
+        // in between, re-plan against the schema this transaction sees.
+        let result = match plan_cache::schema_cookie(&self.conn) {
+            Ok(c) if c == planned_cookie => Ok(()),
+            Ok(c) => plan_for(c).map(|p| plan = p),
+            Err(e) => Err(e),
+        }
+        .and_then(|()| executor::execute_with_ctx(&self.conn, &plan, &ctx));
         match result {
             Ok(records) => {
-                self.conn.execute_batch("COMMIT")?;
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    self.tx_state = TxState::None;
+                    return Err(e.into());
+                }
                 self.tx_state = TxState::None;
                 // Bump schema epoch after successful DDL so the plan cache is
                 // invalidated and subsequent queries pick up the new schema.

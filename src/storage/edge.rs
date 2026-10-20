@@ -66,13 +66,16 @@ pub(crate) fn label_from_edge_props_key(key: &[u8]) -> Option<&str> {
 }
 
 /// Create an edge from src to dst with the given label and properties.
+///
+/// Returns the new edge's sequence number, which identifies it among parallel
+/// edges with the same `(src, dst, label)`.
 pub fn create_edge(
     conn: &Connection,
     src: NodeId,
     dst: NodeId,
     label: &str,
     properties: Properties,
-) -> Result<()> {
+) -> Result<u64> {
     validate_name(label)?;
     for key in properties.keys() {
         validate_name(key)?;
@@ -108,7 +111,7 @@ pub fn create_edge(
     kv::put(conn, kv::TABLE_EDGE_PROPS, &props_key, &data)?;
     crate::stats::increment_edge_type_count(conn, label)?;
 
-    Ok(())
+    Ok(next_seq)
 }
 
 /// Delete an edge from src to dst with the given label.
@@ -756,12 +759,67 @@ pub fn traverse_paths(
 /// Find the shortest path between two nodes using BFS.
 ///
 /// Returns the path as an ordered list of node IDs (including start and end),
+/// Neighbor IDs reachable over any of `labels` (any relationship type when
+/// `labels` is empty) in `direction`, de-duplicated in first-seen order.
+pub fn get_neighbors_multi(
+    conn: &Connection,
+    id: NodeId,
+    labels: &[String],
+    direction: Direction,
+) -> Result<Vec<NodeId>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut push = |raw: u64| {
+        if seen.insert(raw) {
+            out.push(NodeId(raw));
+        }
+    };
+    if labels.is_empty() {
+        // `Direction::Both` in `get_all_edge_labels` merges by label name and
+        // would drop incoming neighbors for labels that also occur outgoing,
+        // so walk each side separately.
+        let sides: &[Direction] = match direction {
+            Direction::Outgoing => &[Direction::Outgoing],
+            Direction::Incoming => &[Direction::Incoming],
+            Direction::Both => &[Direction::Outgoing, Direction::Incoming],
+        };
+        for side in sides {
+            for (_, ids) in get_all_edge_labels(conn, id, *side)? {
+                for raw in ids {
+                    push(raw);
+                }
+            }
+        }
+    } else {
+        for label in labels {
+            for n in get_neighbors(conn, id, label, direction)? {
+                push(n.0);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Relationship types of the edges stored from `src` to `dst`, sorted.
+pub fn edge_types_between(conn: &Connection, src: NodeId, dst: NodeId) -> Result<Vec<String>> {
+    let mut prefix = Vec::with_capacity(16);
+    prefix.extend_from_slice(&src.to_be_bytes());
+    prefix.extend_from_slice(&dst.to_be_bytes());
+    let mut types: Vec<String> = kv::scan_prefix(conn, kv::TABLE_EDGE_PROPS, &prefix)?
+        .iter()
+        .filter_map(|(k, _)| label_from_edge_props_key(k).map(str::to_string))
+        .collect();
+    types.sort();
+    types.dedup();
+    Ok(types)
+}
+
 /// or `None` if no path exists within `max_hops`.
 pub fn shortest_path(
     conn: &Connection,
     start: NodeId,
     end: NodeId,
-    label: &str,
+    labels: &[String],
     direction: Direction,
     max_hops: u32,
 ) -> Result<Option<Vec<NodeId>>> {
@@ -782,7 +840,7 @@ pub fn shortest_path(
             continue;
         }
 
-        let neighbors = get_neighbors(conn, current, label, direction)?;
+        let neighbors = get_neighbors_multi(conn, current, labels, direction)?;
         for neighbor in neighbors {
             if parent.contains_key(&neighbor.0) {
                 continue; // already visited
@@ -816,7 +874,7 @@ pub fn all_shortest_paths(
     conn: &Connection,
     start: NodeId,
     end: NodeId,
-    label: &str,
+    labels: &[String],
     direction: Direction,
     max_hops: u32,
 ) -> Result<Vec<Vec<NodeId>>> {
@@ -849,7 +907,7 @@ pub fn all_shortest_paths(
             continue;
         }
 
-        let neighbors = get_neighbors(conn, current, label, direction)?;
+        let neighbors = get_neighbors_multi(conn, current, labels, direction)?;
         let next_depth = depth + 1;
 
         for neighbor in neighbors {

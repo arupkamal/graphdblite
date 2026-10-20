@@ -32,6 +32,12 @@ pub struct ExecContext {
     pub require_read_only: bool,
     /// Per-query bounded LRU of compiled regexes for the `=~` operator.
     pub regex_cache: RefCell<crate::cypher::eval::regex_cache::RegexCache>,
+    /// Maximum byte size of a single property value written by the query.
+    /// 0 = unlimited. Mirrors `Config::max_property_value_bytes`.
+    pub max_property_value_bytes: usize,
+    /// Maximum byte length of label / relationship-type / property-key names
+    /// written by the query. 0 = unlimited. Mirrors `Config::max_name_bytes`.
+    pub max_name_bytes: usize,
 }
 
 impl Default for ExecContext {
@@ -43,6 +49,8 @@ impl Default for ExecContext {
             procedures: ProcedureRegistry::default(),
             require_read_only: false,
             regex_cache: RefCell::new(crate::cypher::eval::regex_cache::RegexCache::default()),
+            max_property_value_bytes: 0,
+            max_name_bytes: 0,
         }
     }
 }
@@ -214,6 +222,8 @@ pub fn execute_with_ctx(
     use crate::cypher::iter_slot;
 
     validate_traversal_depth(plan, ctx)?;
+    let _write_limits =
+        write::WriteLimitsScope::enter(ctx.max_property_value_bytes, ctx.max_name_bytes);
     if !iter_slot::is_slot_supported(plan) {
         let result = exec(conn, plan, ctx)?;
         return if is_bare_write(plan) {
@@ -335,6 +345,7 @@ pub(in crate::cypher::executor) fn exec(
             property,
             op,
             term,
+            case_insensitive,
             remaining_filters,
         } => read::exec_fulltext_lookup(
             conn,
@@ -342,6 +353,7 @@ pub(in crate::cypher::executor) fn exec(
             alias,
             property,
             *op,
+            *case_insensitive,
             term,
             remaining_filters.as_ref(),
             &NamedRecord::new(),
@@ -495,21 +507,13 @@ pub(in crate::cypher::executor) fn exec(
             src_alias,
             dst_alias,
             path_alias,
-            edge_type,
+            edge_types,
             direction,
             max_hops,
             all_paths,
         } => exec_shortest_path(
-            conn,
-            input,
-            src_alias,
-            dst_alias,
-            path_alias,
-            edge_type.as_deref(),
-            *direction,
-            *max_hops,
-            *all_paths,
-            ctx,
+            conn, input, src_alias, dst_alias, path_alias, edge_types, *direction, *max_hops,
+            *all_paths, ctx,
         ),
 
         LogicalOp::Call {
@@ -621,11 +625,9 @@ use write::{
 // `cypher::executor::<name>` exactly as before.
 pub(crate) use aggregate::aggregate_slot_records;
 pub(crate) use read::{
-    build_compound_binding, compound_binding_vars, exec_fulltext_lookup, expand_record,
-    index_lookup_ids, is_user_visible_field,
+    build_compound_binding, compound_binding_vars, eval_var_length_prop_filters,
+    exec_fulltext_lookup, expand_record, index_lookup_ids, is_user_visible_field,
 };
 pub(in crate::cypher) use util::compare_values_for_sort;
 pub use util::{exec_correlated_exists, exec_correlated_subquery, execute_first_match};
-pub(crate) use util::{
-    fetch_and_populate, literal_to_value, node_to_record, node_to_record_pub, resolve_lookup_key,
-};
+pub(crate) use util::{fetch_and_populate, node_to_record, node_to_record_pub, resolve_lookup_key};

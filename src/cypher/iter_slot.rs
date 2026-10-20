@@ -16,7 +16,7 @@ use rusqlite::Connection;
 
 use crate::cypher::ast::{Expr, ExprKind, ReturnItem};
 use crate::cypher::eval::{eval_expr, eval_predicate, expr_to_column_name};
-use crate::cypher::executor::{literal_to_value, ExecContext};
+use crate::cypher::executor::ExecContext;
 use crate::cypher::ir::LogicalOp;
 use crate::cypher::record::NamedRecord;
 use crate::cypher::record_v2::{Record as SlotRecord, RecordSchema, SlotId};
@@ -365,6 +365,11 @@ fn build_slot_iter_inner<'a>(
             let mut records = Vec::with_capacity(node_ids.len());
             for id in node_ids {
                 let n = node::get_node(conn, id)?;
+                // Only emit nodes that carry the queried label (mirrors
+                // `exec_index_lookup`).
+                if !label.is_empty() && !n.labels.iter().any(|l| l == label) {
+                    continue;
+                }
                 records.push(node_to_slot_record(&n, alias, &schema));
             }
             let base: Box<dyn SlotRecordIter + 'a> = Box::new(VecSlotIter::new(records, schema));
@@ -412,14 +417,7 @@ fn build_slot_iter_inner<'a>(
             let output_schema = infer_with_props(plan, refs);
             let named_input: Box<dyn crate::cypher::iter::RecordIter + 'a> =
                 Box::new(SlotToNamedAdapter::new(input_slot_iter));
-            let prop_filter_values: std::collections::HashMap<String, Value> =
-                var_length_prop_filters
-                    .iter()
-                    .filter_map(|(k, e)| match &e.kind {
-                        ExprKind::Literal(lit) => Some((k.clone(), literal_to_value(lit))),
-                        _ => None,
-                    })
-                    .collect();
+            let prop_filter_values = var_length_prop_filters.clone();
             let named_expand = crate::cypher::iter::ExpandIter::new(
                 named_input,
                 conn,

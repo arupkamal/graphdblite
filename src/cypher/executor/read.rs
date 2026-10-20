@@ -56,6 +56,7 @@ pub(crate) fn exec_fulltext_lookup(
     alias: &str,
     property: &str,
     op: crate::cypher::ir::FullTextOp,
+    case_insensitive: bool,
     term_expr: &Expr,
     remaining_filters: Option<&Expr>,
     record: &NamedRecord,
@@ -64,6 +65,8 @@ pub(crate) fn exec_fulltext_lookup(
     let term = match evaluated {
         Value::String(s) => s,
         Value::Null => return Ok(Vec::new()),
+        // `toLower(<non-string>)` is null, so the predicate can never hold.
+        _ if case_insensitive => return Ok(Vec::new()),
         other => {
             return Err(GraphError::type_error(
                 QueryPhase::Runtime,
@@ -76,7 +79,14 @@ pub(crate) fn exec_fulltext_lookup(
         }
     };
 
-    let candidates = crate::fts::fulltext_lookup(conn, label, property, &term)?;
+    // The FTS index only narrows candidates; `fts_predicate_matches` decides.
+    // A case-insensitive lookup with non-ASCII text could disagree with Rust's
+    // `to_lowercase` (FTS5 uses its own Unicode folding), so scan instead.
+    let candidates = if case_insensitive && !term.is_ascii() {
+        None
+    } else {
+        crate::fts::fulltext_lookup(conn, label, property, &term)?
+    };
     let scored_ids = match candidates {
         Some(rows) => rows,
         None => {
@@ -88,6 +98,7 @@ pub(crate) fn exec_fulltext_lookup(
                 alias,
                 property,
                 op,
+                case_insensitive,
                 &term,
                 remaining_filters,
             );
@@ -97,9 +108,13 @@ pub(crate) fn exec_fulltext_lookup(
     let mut records = Vec::new();
     for (id, rank) in scored_ids {
         let n = node::get_node(conn, id)?;
-        // Anchored post-filter: CONTAINS needs no check (trigram is exact);
-        // STARTS WITH / ENDS WITH need a position check.
-        if !fts_anchor_matches(&n.properties, property, op, &term) {
+        // Re-check every candidate with the exact predicate: anchored ops need
+        // a position check, and a case-insensitive index returns candidates
+        // that a case-sensitive predicate must reject (and vice versa).
+        let Some(Value::String(s)) = n.properties.get(property) else {
+            continue;
+        };
+        if !fts_predicate_matches(s, op, case_insensitive, &term) {
             continue;
         }
         let mut rec = node_to_record(&n, alias);
@@ -118,51 +133,47 @@ pub(crate) fn exec_fulltext_lookup(
     Ok(records)
 }
 
-/// Returns true if the node's property value satisfies the anchored string op.
-///
-/// For `Contains` always returns true — the trigram lookup guarantees the
-/// substring is present. For `StartsWith`/`EndsWith` we re-check position.
-fn fts_anchor_matches(
-    properties: &crate::types::Properties,
-    property: &str,
+/// Evaluate the string predicate a `FullTextLookup` stands for:
+/// `s <op> term` (case-sensitive), or `toLower(s) <op> toLower(term)`.
+fn fts_predicate_matches(
+    s: &str,
     op: crate::cypher::ir::FullTextOp,
+    case_insensitive: bool,
     term: &str,
 ) -> bool {
     use crate::cypher::ir::FullTextOp;
-    let Some(Value::String(s)) = properties.get(property) else {
-        return false;
+    let (s, term): (std::borrow::Cow<str>, std::borrow::Cow<str>) = if case_insensitive {
+        (s.to_lowercase().into(), term.to_lowercase().into())
+    } else {
+        (s.into(), term.into())
     };
     match op {
-        FullTextOp::Contains => true,
-        FullTextOp::StartsWith => s.starts_with(term),
-        FullTextOp::EndsWith => s.ends_with(term),
+        FullTextOp::Contains => s.contains(term.as_ref()),
+        FullTextOp::StartsWith => s.starts_with(term.as_ref()),
+        FullTextOp::EndsWith => s.ends_with(term.as_ref()),
     }
 }
 
 /// Fallback for when the term is below the trigram floor (<3 codepoints).
 /// Performs a full label scan with per-row string predicate evaluation.
+#[allow(clippy::too_many_arguments)]
 fn exec_fulltext_fallback(
     conn: &Connection,
     label: &str,
     alias: &str,
     property: &str,
     op: crate::cypher::ir::FullTextOp,
+    case_insensitive: bool,
     term: &str,
     remaining_filters: Option<&Expr>,
 ) -> Result<Vec<NamedRecord>> {
-    use crate::cypher::ir::FullTextOp;
     let nodes = node::find_nodes_by_label(conn, label)?;
     let mut records = Vec::new();
     for n in nodes {
         let Some(Value::String(s)) = n.properties.get(property) else {
             continue;
         };
-        let matches = match op {
-            FullTextOp::Contains => s.contains(term),
-            FullTextOp::StartsWith => s.starts_with(term),
-            FullTextOp::EndsWith => s.ends_with(term),
-        };
-        if !matches {
+        if !fts_predicate_matches(s, op, case_insensitive, term) {
             continue;
         }
         let mut rec = node_to_record(&n, alias);
@@ -251,7 +262,162 @@ pub(crate) fn index_lookup_ids(
         .map(|(_, k)| crate::cypher::executor::resolve_lookup_key(k))
         .collect::<Result<_>>()?;
     let full_props_refs: Vec<&str> = index_properties.iter().map(String::as_str).collect();
-    index::composite_index_prefix_lookup(conn, label, &full_props_refs, &values)
+
+    // Cypher equality semantics, which the index (keyed on exact msgpack bytes)
+    // does not provide on its own:
+    // - `x = null` (and anything containing null / NaN) is never true;
+    // - integers and floats compare numerically (`1 = 1.0`, `0.0 = -0.0`).
+    // Expand each value into every stored representation it is equal to and
+    // union the lookups. Pathologically large expansions fall back to a label
+    // scan with an explicit equality check.
+    let mut per_value: Vec<Vec<Value>> = Vec::with_capacity(values.len());
+    let mut combos: usize = 1;
+    for v in &values {
+        match index_equality_variants(v) {
+            EqVariants::Never => return Ok(Vec::new()),
+            EqVariants::TooMany => combos = usize::MAX,
+            EqVariants::Values(vs) => {
+                combos = combos.saturating_mul(vs.len());
+                per_value.push(vs);
+            }
+        }
+    }
+    if combos > MAX_INDEX_LOOKUP_VARIANTS {
+        let props: Vec<&str> = lookups.iter().map(|(p, _)| p.as_str()).collect();
+        return Ok(node::find_nodes_by_label(conn, label)?
+            .into_iter()
+            .filter(|n| {
+                props.iter().zip(&values).all(|(p, v)| {
+                    n.properties
+                        .get(*p)
+                        .is_some_and(|stored| cypher_values_equal(stored, v))
+                })
+            })
+            .map(|n| n.id)
+            .collect());
+    }
+    if combos == 1 {
+        let single: Vec<Value> = per_value.into_iter().map(|mut v| v.remove(0)).collect();
+        return index::composite_index_prefix_lookup(conn, label, &full_props_refs, &single);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut combo: Vec<Value> = Vec::with_capacity(per_value.len());
+    fn walk(
+        conn: &Connection,
+        label: &str,
+        props: &[&str],
+        per_value: &[Vec<Value>],
+        combo: &mut Vec<Value>,
+        seen: &mut std::collections::HashSet<NodeId>,
+        out: &mut Vec<NodeId>,
+    ) -> Result<()> {
+        if combo.len() == per_value.len() {
+            for id in index::composite_index_prefix_lookup(conn, label, props, combo)? {
+                if seen.insert(id) {
+                    out.push(id);
+                }
+            }
+            return Ok(());
+        }
+        for v in &per_value[combo.len()] {
+            combo.push(v.clone());
+            walk(conn, label, props, per_value, combo, seen, out)?;
+            combo.pop();
+        }
+        Ok(())
+    }
+    walk(
+        conn,
+        label,
+        &full_props_refs,
+        &per_value,
+        &mut combo,
+        &mut seen,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// Upper bound on the number of exact-representation lookups a single index
+/// probe may expand into (see [`index_equality_variants`]).
+const MAX_INDEX_LOOKUP_VARIANTS: usize = 64;
+
+/// Result of [`index_equality_variants`].
+enum EqVariants {
+    /// Nothing is Cypher-equal to the value (null, NaN, or a list containing one).
+    Never,
+    /// Every exact stored representation that is Cypher-equal to the value.
+    Values(Vec<Value>),
+    /// Too many representations to enumerate; the caller should scan.
+    TooMany,
+}
+
+/// Every stored value that is Cypher-equal to `v` (e.g. `1` is equal to the
+/// stored `1` and `1.0`; a list expands element-wise).
+fn index_equality_variants(v: &Value) -> EqVariants {
+    const EXACT_F64_INT_LIMIT: i64 = 1 << 53;
+    match v {
+        Value::Null => EqVariants::Never,
+        Value::F64(f) if f.is_nan() => EqVariants::Never,
+        Value::I64(i) => {
+            let mut out = vec![Value::I64(*i)];
+            if i.unsigned_abs() <= EXACT_F64_INT_LIMIT as u64 {
+                out.push(Value::F64(*i as f64));
+                if *i == 0 {
+                    out.push(Value::F64(-0.0));
+                }
+            }
+            EqVariants::Values(out)
+        }
+        Value::F64(f) => {
+            let mut out = vec![Value::F64(*f)];
+            if *f == 0.0 {
+                out.push(Value::F64(if f.is_sign_negative() { 0.0 } else { -0.0 }));
+            }
+            if f.fract() == 0.0 && f.abs() <= EXACT_F64_INT_LIMIT as f64 {
+                out.push(Value::I64(*f as i64));
+            }
+            EqVariants::Values(out)
+        }
+        Value::List(items) => {
+            let mut acc: Vec<Vec<Value>> = vec![Vec::with_capacity(items.len())];
+            for item in items {
+                let vs = match index_equality_variants(item) {
+                    EqVariants::Values(vs) => vs,
+                    other => return other,
+                };
+                if acc.len().saturating_mul(vs.len()) > MAX_INDEX_LOOKUP_VARIANTS {
+                    return EqVariants::TooMany;
+                }
+                let mut next = Vec::with_capacity(acc.len() * vs.len());
+                for prefix in &acc {
+                    for alt in &vs {
+                        let mut p = prefix.clone();
+                        p.push(alt.clone());
+                        next.push(p);
+                    }
+                }
+                acc = next;
+            }
+            EqVariants::Values(acc.into_iter().map(Value::List).collect())
+        }
+        other => EqVariants::Values(vec![other.clone()]),
+    }
+}
+
+/// Cypher `=` for stored property values: numeric cross-type comparison,
+/// element-wise for lists, and plain equality otherwise. Null never matches.
+fn cypher_values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => false,
+        (Value::I64(x), Value::F64(y)) | (Value::F64(y), Value::I64(x)) => (*x as f64) == *y,
+        (Value::F64(x), Value::F64(y)) => x == y,
+        (Value::List(x), Value::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| cypher_values_equal(p, q))
+        }
+        _ => a == b,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -273,14 +439,11 @@ pub(in crate::cypher::executor) fn exec_expand(
     let input_records = exec(conn, input, ctx)?;
     let mut results = Vec::new();
 
-    let prop_filter_values: HashMap<String, Value> = var_length_prop_filters
-        .iter()
-        .filter_map(|(k, expr)| match &expr.kind {
-            ExprKind::Literal(lit) => Some((k.clone(), literal_to_value(lit))),
-            _ => None,
-        })
-        .collect();
     for rec in &input_records {
+        // Relationship property constraints on a var-length pattern may be
+        // any expression (parameters, variables, arithmetic) — evaluate them
+        // against the current row rather than keeping only literals.
+        let prop_filter_values = eval_var_length_prop_filters(conn, var_length_prop_filters, rec)?;
         if let Some(cap) = result_cap {
             if results.len() >= cap {
                 break;
@@ -307,6 +470,25 @@ pub(in crate::cypher::executor) fn exec_expand(
 
     check_row_limit(&results, ctx)?;
     Ok(results)
+}
+
+/// Evaluate the relationship property map of a var-length pattern against
+/// `rec`. Every entry is kept: dropping non-literal entries would silently
+/// widen the match.
+pub(crate) fn eval_var_length_prop_filters(
+    conn: &Connection,
+    filters: &HashMap<String, Expr>,
+    rec: &NamedRecord,
+) -> Result<HashMap<String, Value>> {
+    let mut out = HashMap::with_capacity(filters.len());
+    for (k, expr) in filters {
+        let v = match &expr.kind {
+            ExprKind::Literal(lit) => literal_to_value(lit),
+            _ => eval_expr(expr, rec, crate::cypher::eval::EvalCx::new(conn))?,
+        };
+        out.insert(k.clone(), v);
+    }
+    Ok(out)
 }
 
 /// Expand one input record into zero or more output records. Handles every
@@ -966,6 +1148,7 @@ mod tests {
             "n",
             "body",
             FullTextOp::Contains,
+            false,
             &term_expr,
             None,
             &outer,
@@ -994,9 +1177,17 @@ mod tests {
         crate::storage::fts::create_fulltext_index(&conn, "Doc", "body").unwrap();
 
         // Term length 2 is below the trigram floor → fallback path.
-        let records =
-            exec_fulltext_fallback(&conn, "Doc", "n", "body", FullTextOp::Contains, "ab", None)
-                .unwrap();
+        let records = exec_fulltext_fallback(
+            &conn,
+            "Doc",
+            "n",
+            "body",
+            FullTextOp::Contains,
+            false,
+            "ab",
+            None,
+        )
+        .unwrap();
         assert_eq!(records.len(), 1);
         let score = records[0]
             .get("n.__fts_score")

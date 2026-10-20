@@ -103,12 +103,15 @@ pub(in crate::cypher::executor) fn exec_materialize_path(
     Ok(results)
 }
 
-/// Aggregate pre-computed records (used by correlated execution).
-/// Reuses the existing `compute_aggregate` function.
+/// Materialize a node-id sequence produced by the shortest-path BFS into a
+/// `PathValue`, resolving each hop to a concrete stored edge whose type is in
+/// `edge_types` (any type when empty) and whose orientation is allowed by
+/// `direction`.
 pub(in crate::cypher::executor) fn build_path_value(
     conn: &Connection,
     node_ids: Vec<NodeId>,
-    label: &str,
+    edge_types: &[String],
+    direction: Direction,
 ) -> Result<crate::types::PathValue> {
     use crate::types::{Edge, PathValue};
 
@@ -124,20 +127,37 @@ pub(in crate::cypher::executor) fn build_path_value(
         nodes.push(crate::node::get_node(conn, *id)?);
     }
 
+    let pick = |src: NodeId, dst: NodeId| -> Result<Option<String>> {
+        Ok(edge::edge_types_between(conn, src, dst)?
+            .into_iter()
+            .find(|t| edge_types.is_empty() || edge_types.iter().any(|e| e == t)))
+    };
+
     let mut edges = Vec::with_capacity(node_ids.len().saturating_sub(1));
     for pair in node_ids.windows(2) {
         let (a, b) = (pair[0], pair[1]);
-        // Try forward first; fall back to reverse for Direction::Both traversals.
-        let (src, dst) = if edge::edge_exists(conn, a, b, label)? {
-            (a, b)
+        let forward = matches!(direction, Direction::Outgoing | Direction::Both);
+        let backward = matches!(direction, Direction::Incoming | Direction::Both);
+        let hop = if forward {
+            pick(a, b)?.map(|t| (a, b, t))
         } else {
-            (b, a)
+            None
         };
-        let properties = edge::get_edge_properties(conn, src, dst, label)?;
+        let hop = match hop {
+            Some(h) => Some(h),
+            None if backward => pick(b, a)?.map(|t| (b, a, t)),
+            None => None,
+        };
+        let (src, dst, label) = hop.ok_or_else(|| {
+            GraphError::semantic(format!(
+                "shortest path hop {a} -> {b} has no matching relationship"
+            ))
+        })?;
+        let properties = edge::get_edge_properties(conn, src, dst, &label)?;
         edges.push(Edge {
             src,
             dst,
-            label: label.to_string(),
+            label,
             properties,
         });
     }
@@ -152,14 +172,13 @@ pub(in crate::cypher::executor) fn exec_shortest_path(
     src_alias: &str,
     dst_alias: &str,
     path_alias: &str,
-    edge_type: Option<&str>,
+    edge_types: &[String],
     direction: Direction,
     max_hops: u32,
     all_paths: bool,
     ctx: &ExecContext,
 ) -> Result<Vec<NamedRecord>> {
     let records = exec(conn, input, ctx)?;
-    let label = edge_type.unwrap_or("");
     let mut results = Vec::new();
 
     for rec in &records {
@@ -173,7 +192,8 @@ pub(in crate::cypher::executor) fn exec_shortest_path(
         };
 
         if all_paths {
-            let paths = edge::all_shortest_paths(conn, src_id, dst_id, label, direction, max_hops)?;
+            let paths =
+                edge::all_shortest_paths(conn, src_id, dst_id, edge_types, direction, max_hops)?;
             if paths.is_empty() {
                 // No path found — emit record with null path.
                 let mut new_rec = rec.clone();
@@ -181,18 +201,18 @@ pub(in crate::cypher::executor) fn exec_shortest_path(
                 results.push(new_rec);
             } else {
                 for path in paths {
-                    let path_value = build_path_value(conn, path, label)?;
+                    let path_value = build_path_value(conn, path, edge_types, direction)?;
                     let mut new_rec = rec.clone();
                     new_rec.set(path_alias.to_string(), Value::Path(path_value));
                     results.push(new_rec);
                 }
             }
         } else {
-            let path = edge::shortest_path(conn, src_id, dst_id, label, direction, max_hops)?;
+            let path = edge::shortest_path(conn, src_id, dst_id, edge_types, direction, max_hops)?;
             let mut new_rec = rec.clone();
             match path {
                 Some(p) => {
-                    let path_value = build_path_value(conn, p, label)?;
+                    let path_value = build_path_value(conn, p, edge_types, direction)?;
                     new_rec.set(path_alias.to_string(), Value::Path(path_value));
                 }
                 None => new_rec.set(path_alias.to_string(), Value::Null),

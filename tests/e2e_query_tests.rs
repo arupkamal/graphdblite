@@ -4934,13 +4934,26 @@ fn fts_ci_index_matches_across_case() {
     db.execute("CREATE (:Person {name:'Alice Smith'}), (:Person {name:'Bob Jones'})")
         .unwrap();
 
+    // Case-insensitive matching is expressed with the `toLower` idiom, which
+    // the CI index accelerates.
     let rows = db
         .execute(
-            "MATCH (n:Person) WHERE n.name CONTAINS 'alice' RETURN n.name AS name ORDER BY name",
+            "MATCH (n:Person) WHERE toLower(n.name) CONTAINS toLower('alice') \
+             RETURN n.name AS name ORDER BY name",
         )
         .unwrap();
     let names: Vec<String> = rows.iter().map(|r| string_field(r, "name")).collect();
     assert_eq!(names, vec!["Alice Smith".to_string()]);
+
+    // An index must not change query semantics: a plain CONTAINS stays
+    // case-sensitive even when served by the CI index.
+    let rows = db
+        .execute("MATCH (n:Person) WHERE n.name CONTAINS 'alice' RETURN n.name AS name")
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "plain CONTAINS must be case-sensitive: {rows:?}"
+    );
 }
 
 #[test]

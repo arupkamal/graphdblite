@@ -80,7 +80,11 @@ pub fn plan_patterns(conn: &Connection, patterns: &[Pattern]) -> crate::types::R
 
     // Apply shortest-path patterns last (they need bound variables).
     for pattern in &shortest {
-        let right = plan_shortest_path_pattern(conn, pattern, op.take())?;
+        let right = plan_shortest_path_pattern(conn, pattern, op.take(), &bound_vars)?;
+        bound_vars.extend(collect_pattern_variables(std::slice::from_ref(*pattern)));
+        if let Some(pv) = &pattern.path_variable {
+            bound_vars.insert(pv.clone());
+        }
         op = Some(right);
     }
 
@@ -95,6 +99,7 @@ pub(in crate::cypher::planner) fn plan_shortest_path_pattern(
     conn: &Connection,
     pattern: &Pattern,
     existing_input: Option<LogicalOp>,
+    bound_vars: &HashSet<String>,
 ) -> crate::types::Result<LogicalOp> {
     // Validate structure: must be exactly (node)-[rel]->(node).
     if pattern.elements.len() != 3 {
@@ -151,9 +156,26 @@ pub(in crate::cypher::planner) fn plan_shortest_path_pattern(
 
     // Build input: scan both endpoints and cross-product them.
     let input = if let Some(existing) = existing_input {
-        // If we already have bound variables, use the existing pipeline.
-        // Plan additional scans only for unbound nodes.
-        existing
+        // Reuse the existing pipeline for endpoints it already binds (adding
+        // any label/property constraints the shortestPath pattern puts on
+        // them), and scan endpoints it does not bind yet.
+        let mut input = existing;
+        for (node, alias) in [(src_node, &src_alias), (dst_node, &dst_alias)] {
+            let is_bound = node
+                .variable
+                .as_ref()
+                .is_some_and(|v| bound_vars.contains(v));
+            if is_bound {
+                input = wrap_node_constraint_filters(input, node, alias);
+            } else {
+                input = LogicalOp::CrossProduct {
+                    left: Box::new(input),
+                    right: Box::new(plan_node_scan(conn, node, alias)?),
+                    same_match: false,
+                };
+            }
+        }
+        input
     } else {
         let src_scan = plan_node_scan(conn, src_node, &src_alias)?;
         let dst_scan = plan_node_scan(conn, dst_node, &dst_alias)?;
@@ -169,7 +191,7 @@ pub(in crate::cypher::planner) fn plan_shortest_path_pattern(
         src_alias,
         dst_alias,
         path_alias,
-        edge_type: rel.rel_types.first().cloned(),
+        edge_types: rel.rel_types.clone(),
         direction,
         max_hops,
         all_paths: pattern.shortest_path_mode == ShortestPathMode::All,
@@ -388,6 +410,56 @@ pub(in crate::cypher::planner) fn plan_single_pattern(
     Ok(result)
 }
 
+/// Wrap `op` in one `'<label>' IN alias.__labels` filter per label after the
+/// first. Scans and index lookups are keyed on the first label only.
+fn wrap_extra_label_filters(mut op: LogicalOp, node: &NodePattern, alias: &str) -> LogicalOp {
+    for extra_label in node.labels.iter().skip(1) {
+        let predicate = Expr::synthetic(ExprKind::BinaryOp {
+            left: Box::new(Expr::synthetic(ExprKind::Literal(LiteralValue::String(
+                extra_label.clone(),
+            )))),
+            op: BinOp::In,
+            right: Box::new(Expr::synthetic(ExprKind::Property(
+                alias.to_string(),
+                "__labels".to_string(),
+            ))),
+        });
+        op = LogicalOp::Filter {
+            input: Box::new(op),
+            predicate,
+        };
+    }
+    op
+}
+
+/// Filter `op` so the node bound to `alias` satisfies every label and inline
+/// property of `node` (used when the variable is already bound upstream).
+fn wrap_node_constraint_filters(mut op: LogicalOp, node: &NodePattern, alias: &str) -> LogicalOp {
+    if let Some(first) = node.labels.first() {
+        op = LogicalOp::Filter {
+            input: Box::new(op),
+            predicate: Expr::synthetic(ExprKind::BinaryOp {
+                left: Box::new(Expr::synthetic(ExprKind::Literal(LiteralValue::String(
+                    first.clone(),
+                )))),
+                op: BinOp::In,
+                right: Box::new(Expr::synthetic(ExprKind::Property(
+                    alias.to_string(),
+                    "__labels".to_string(),
+                ))),
+            }),
+        };
+    }
+    op = wrap_extra_label_filters(op, node, alias);
+    if !node.properties.is_empty() {
+        op = LogicalOp::Filter {
+            input: Box::new(op),
+            predicate: properties_to_filter(alias, &node.properties),
+        };
+    }
+    op
+}
+
 /// Plan the scan for a single node pattern, using an index lookup if available.
 pub(in crate::cypher::planner) fn plan_node_scan(
     conn: &Connection,
@@ -447,40 +519,28 @@ pub(in crate::cypher::planner) fn plan_node_scan(
                     Some(properties_to_filter(alias, &remaining))
                 };
 
-                return Ok(LogicalOp::IndexLookup {
+                let lookup = LogicalOp::IndexLookup {
                     label,
                     alias: alias.to_string(),
                     index_properties,
                     lookups,
                     remaining_filters,
-                });
+                };
+                // The index is keyed on the first label only; the node must
+                // still carry every other label in the pattern.
+                return Ok(wrap_extra_label_filters(lookup, node, alias));
             }
         }
     }
 
     // Fallback: full label scan + filter.
-    let mut scan = LogicalOp::Scan {
+    let scan = LogicalOp::Scan {
         label,
         alias: alias.to_string(),
     };
 
     // Add filters for additional labels (multi-label nodes).
-    for extra_label in node.labels.iter().skip(1) {
-        let predicate = Expr::synthetic(ExprKind::BinaryOp {
-            left: Box::new(Expr::synthetic(ExprKind::Literal(LiteralValue::String(
-                extra_label.clone(),
-            )))),
-            op: BinOp::In,
-            right: Box::new(Expr::synthetic(ExprKind::Property(
-                alias.to_string(),
-                "__labels".to_string(),
-            ))),
-        });
-        scan = LogicalOp::Filter {
-            input: Box::new(scan),
-            predicate,
-        };
-    }
+    let mut scan = wrap_extra_label_filters(scan, node, alias);
 
     if !node.properties.is_empty() {
         let predicate = properties_to_filter(alias, &node.properties);

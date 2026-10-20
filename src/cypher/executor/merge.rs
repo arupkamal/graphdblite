@@ -8,6 +8,7 @@ use crate::cypher::record::NamedRecord;
 use crate::types::*;
 use crate::{edge, fts, index, node};
 
+use super::write::{validate_write_labels, validate_write_properties, validate_write_value};
 use super::*;
 
 pub(in crate::cypher::executor) fn apply_merge_set_item_node(
@@ -26,9 +27,15 @@ pub(in crate::cypher::executor) fn apply_merge_set_item_node(
                 &a_rec,
                 crate::cypher::eval::EvalCx::new(conn),
             )?;
+            validate_write_value(&assignment.property, &val)?;
             node::set_node_property(conn, node_id, &assignment.property, val.clone())?;
             let mut new_props = old.properties.clone();
-            new_props.insert(assignment.property.clone(), val);
+            // `SET n.p = null` removes the property; never index a Null.
+            if val == Value::Null {
+                new_props.remove(&assignment.property);
+            } else {
+                new_props.insert(assignment.property.clone(), val);
+            }
             index::update_indexes_for_node(
                 conn,
                 node_id,
@@ -50,6 +57,7 @@ pub(in crate::cypher::executor) fn apply_merge_set_item_node(
         } => {
             // Adding labels can bring new per-label indexes into scope for this
             // node, so re-insert index/FTS entries across the full label set.
+            validate_write_labels(labels)?;
             for label in labels {
                 node::add_node_label(conn, node_id, label)?;
             }
@@ -59,6 +67,7 @@ pub(in crate::cypher::executor) fn apply_merge_set_item_node(
         }
         SetItem::MapMerge { variable: _, value } => {
             let map = resolve_to_map(value, rec, conn)?;
+            validate_non_null_entries(&map)?;
             let old = node::get_node(conn, node_id)?;
             let mut new_props = old.properties.clone();
             for (k, v) in &map {
@@ -73,6 +82,7 @@ pub(in crate::cypher::executor) fn apply_merge_set_item_node(
         }
         SetItem::MapOverwrite { variable: _, value } => {
             let map = resolve_to_map(value, rec, conn)?;
+            validate_non_null_entries(&map)?;
             // Clear existing properties and set new ones.
             let old = node::get_node(conn, node_id)?;
             for key in old.properties.keys() {
@@ -106,48 +116,6 @@ fn maintain_indexes_after_prop_change(
     Ok(())
 }
 
-/// Apply a single SetItem to an edge in a MERGE ON CREATE/ON MATCH context.
-pub(in crate::cypher::executor) fn apply_merge_set_item_edge(
-    conn: &Connection,
-    item: &SetItem,
-    src_id: NodeId,
-    dst_id: NodeId,
-    edge_type: &str,
-    rec: &NamedRecord,
-) -> Result<()> {
-    match item {
-        SetItem::Property(assignment) => {
-            let val = eval_expr(
-                &assignment.value,
-                rec,
-                crate::cypher::eval::EvalCx::new(conn),
-            )?;
-            edge::set_edge_property(conn, src_id, dst_id, edge_type, &assignment.property, val)?;
-        }
-        SetItem::Label { .. } => {
-            // Labels on edges are not standard Cypher; ignore.
-        }
-        SetItem::MapMerge { variable: _, value } => {
-            let map = resolve_to_map(value, rec, conn)?;
-            for (k, v) in &map {
-                edge::set_edge_property(conn, src_id, dst_id, edge_type, k, v.clone())?;
-            }
-        }
-        SetItem::MapOverwrite { variable: _, value } => {
-            let map = resolve_to_map(value, rec, conn)?;
-            // For overwrite on edges, clear existing props then set new ones.
-            let old_props = edge::get_edge_properties(conn, src_id, dst_id, edge_type)?;
-            for key in old_props.keys() {
-                edge::set_edge_property(conn, src_id, dst_id, edge_type, key, Value::Null)?;
-            }
-            for (k, v) in &map {
-                edge::set_edge_property(conn, src_id, dst_id, edge_type, k, v.clone())?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Apply a single SetItem to a specific parallel edge by sequence number.
 pub(in crate::cypher::executor) fn apply_merge_set_item_edge_at(
     conn: &Connection,
@@ -165,6 +133,7 @@ pub(in crate::cypher::executor) fn apply_merge_set_item_edge_at(
                 rec,
                 crate::cypher::eval::EvalCx::new(conn),
             )?;
+            validate_write_value(&assignment.property, &val)?;
             edge::set_edge_property_at(
                 conn,
                 src_id,
@@ -178,12 +147,14 @@ pub(in crate::cypher::executor) fn apply_merge_set_item_edge_at(
         SetItem::Label { .. } => {}
         SetItem::MapMerge { variable: _, value } => {
             let map = resolve_to_map(value, rec, conn)?;
+            validate_non_null_entries(&map)?;
             for (k, v) in &map {
                 edge::set_edge_property_at(conn, src_id, dst_id, edge_type, seq, k, v.clone())?;
             }
         }
         SetItem::MapOverwrite { variable: _, value } => {
             let map = resolve_to_map(value, rec, conn)?;
+            validate_non_null_entries(&map)?;
             let old_props = edge::get_edge_properties_at(conn, src_id, dst_id, edge_type, seq)?;
             for key in old_props.keys() {
                 edge::set_edge_property_at(conn, src_id, dst_id, edge_type, seq, key, Value::Null)?;
@@ -191,6 +162,18 @@ pub(in crate::cypher::executor) fn apply_merge_set_item_edge_at(
             for (k, v) in &map {
                 edge::set_edge_property_at(conn, src_id, dst_id, edge_type, seq, k, v.clone())?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Validate every non-null entry of a `SET x = map` / `SET x += map` payload
+/// (null entries mean "remove" and are always allowed).
+fn validate_non_null_entries(map: &Properties) -> Result<()> {
+    for (k, v) in map {
+        if *v != Value::Null {
+            validate_write_value(k, v)?;
+            crate::types::validate_name(k)?;
         }
     }
     Ok(())
@@ -275,6 +258,8 @@ pub(in crate::cypher::executor) fn exec_merge_node(
         }
         None => {
             let labels: Vec<String> = all_labels.iter().map(|s| s.to_string()).collect();
+            validate_write_labels(&labels)?;
+            validate_write_properties(&props)?;
             let id = node::create_node(conn, &labels, props.clone())?;
             index::update_indexes_for_node(conn, id, &labels, None, &props)?;
             fts::update_fts_for_node(conn, id, &labels, None, &props)?;
@@ -328,96 +313,151 @@ pub(in crate::cypher::executor) fn exec_merge_relationship(
         _ => unreachable!(),
     };
 
-    let src_label = src_pat.labels.first().map(|s| s.as_str()).unwrap_or("");
-    let dst_label = dst_pat.labels.first().map(|s| s.as_str()).unwrap_or("");
+    // Find or create source and destination nodes (all labels respected).
+    let src_id = find_or_create_merge_node(conn, &src_pat.labels, &src_pat.properties)?;
+    let dst_id = find_or_create_merge_node(conn, &dst_pat.labels, &dst_pat.properties)?;
+
+    let mut base = NamedRecord::new();
+    for (pat, id) in [(src_pat, src_id), (dst_pat, dst_id)] {
+        if let Some(ref v) = pat.variable {
+            base.set(v.clone(), Value::I64(id.0 as i64));
+            base.set(format!("{v}.__id"), Value::I64(id.0 as i64));
+        }
+    }
+    merge_edge_between(
+        conn,
+        &base,
+        src_id,
+        dst_id,
+        rel,
+        pattern.path_variable.as_ref(),
+        on_create,
+        on_match,
+    )
+}
+
+/// Match-or-create the relationship described by `rel` between the pattern's
+/// left node `left_id` and right node `right_id`, honouring the pattern's
+/// direction: `(l)-[]->(r)` is `l→r`, `(l)<-[]-(r)` is `r→l`, and an undirected
+/// `(l)-[]-(r)` matches either orientation and creates `l→r`.
+///
+/// Returns one row per matched parallel edge (with ON MATCH applied to that
+/// edge), or a single row for the newly created edge (with ON CREATE applied
+/// to exactly that edge). The relationship variable and the optional path
+/// variable are bound in every row.
+#[allow(clippy::too_many_arguments)]
+fn merge_edge_between(
+    conn: &Connection,
+    base_rec: &NamedRecord,
+    left_id: NodeId,
+    right_id: NodeId,
+    rel: &crate::cypher::ast::RelPattern,
+    path_var: Option<&String>,
+    on_create: &[SetItem],
+    on_match: &[SetItem],
+) -> Result<Vec<NamedRecord>> {
+    use crate::cypher::ast::RelDirection;
+
     let edge_type = rel.rel_types.first().cloned().unwrap_or_default();
+    let (src_id, dst_id) = match rel.direction {
+        RelDirection::Incoming => (right_id, left_id),
+        _ => (left_id, right_id),
+    };
+    let undirected = matches!(rel.direction, RelDirection::Undirected);
 
-    // Find or create source and destination nodes.
-    let src_id = find_or_create_merge_node(conn, src_label, &src_pat.properties)?;
-    let dst_id = find_or_create_merge_node(conn, dst_label, &dst_pat.properties)?;
-
-    // Pre-evaluate edge properties and check for null.
-    let mut edge_props = Properties::new();
-    let dummy_rec = NamedRecord::new();
+    // Pre-evaluate merge pattern edge properties.
+    let mut merge_edge_props = Properties::new();
     for (key, expr) in &rel.properties {
-        let val = eval_expr(expr, &dummy_rec, crate::cypher::eval::EvalCx::new(conn))?;
+        let val = eval_expr(expr, base_rec, crate::cypher::eval::EvalCx::new(conn))?;
         if val == Value::Null {
             return Err(GraphError::semantic("MERGE with null property value")
                 .with_code(ErrorCode::MergeReadOwnWrites));
         }
-        edge_props.insert(key.clone(), val);
+        merge_edge_props.insert(key.clone(), val);
     }
 
-    // Find or create the edge (checking properties too).
-    let edge_match = if edge::edge_exists(conn, src_id, dst_id, &edge_type)? {
-        if edge_props.is_empty() {
-            true
-        } else {
-            let existing_props = edge::get_edge_properties(conn, src_id, dst_id, &edge_type)?;
-            edge_props
-                .iter()
-                .all(|(k, v)| existing_props.get(k) == Some(v))
-        }
-    } else {
-        false
+    let find_matching_edges = |s: NodeId, d: NodeId| -> Result<Vec<(u64, Properties)>> {
+        let all = edge::get_all_edge_props(conn, s, d, &edge_type)?;
+        Ok(all
+            .into_iter()
+            .filter(|(_, props)| {
+                merge_edge_props
+                    .iter()
+                    .all(|(k, v)| props.get(k) == Some(v))
+            })
+            .collect())
     };
-    if !edge_match {
-        edge::create_edge(conn, src_id, dst_id, &edge_type, edge_props)?;
-        let mut rec = NamedRecord::new();
-        if let Some(ref v) = src_pat.variable {
-            rec.set(v.clone(), Value::I64(src_id.0 as i64));
+
+    let mut matched: Vec<(NodeId, NodeId, u64)> = Vec::new();
+    for (seq, _) in find_matching_edges(src_id, dst_id)? {
+        matched.push((src_id, dst_id, seq));
+    }
+    if undirected && src_id != dst_id {
+        for (seq, _) in find_matching_edges(dst_id, src_id)? {
+            matched.push((dst_id, src_id, seq));
         }
-        if let Some(ref v) = dst_pat.variable {
-            rec.set(v.clone(), Value::I64(dst_id.0 as i64));
-        }
+    }
+
+    if matched.is_empty() {
+        validate_write_labels(std::slice::from_ref(&edge_type))?;
+        validate_write_properties(&merge_edge_props)?;
+        let seq = edge::create_edge(conn, src_id, dst_id, &edge_type, merge_edge_props)?;
         for item in on_create {
-            apply_merge_set_item_edge(conn, item, src_id, dst_id, &edge_type, &rec)?;
+            apply_merge_set_item_edge_at(conn, item, src_id, dst_id, &edge_type, seq, base_rec)?;
         }
+        matched.push((src_id, dst_id, seq));
     } else {
-        let mut rec = NamedRecord::new();
-        if let Some(ref v) = src_pat.variable {
-            rec.set(v.clone(), Value::I64(src_id.0 as i64));
-        }
-        if let Some(ref v) = dst_pat.variable {
-            rec.set(v.clone(), Value::I64(dst_id.0 as i64));
-        }
-        for item in on_match {
-            apply_merge_set_item_edge(conn, item, src_id, dst_id, &edge_type, &rec)?;
+        for (s, d, seq) in &matched {
+            for item in on_match {
+                apply_merge_set_item_edge_at(conn, item, *s, *d, &edge_type, *seq, base_rec)?;
+            }
         }
     }
 
-    let mut rec = NamedRecord::new();
-    if let Some(ref v) = src_pat.variable {
-        rec.set(v.clone(), Value::I64(src_id.0 as i64));
+    let mut rows = Vec::with_capacity(matched.len());
+    for (s, d, seq) in matched {
+        let mut out = base_rec.clone();
+        let props = edge::get_edge_properties_at(conn, s, d, &edge_type, seq)?;
+        if let Some(ref r_alias) = rel.variable {
+            out.set(r_alias.clone(), Value::String(edge_type.clone()));
+            out.set(format!("{r_alias}.__src"), Value::I64(s.0 as i64));
+            out.set(format!("{r_alias}.__dst"), Value::I64(d.0 as i64));
+            out.set(
+                format!("{r_alias}.__type"),
+                Value::String(edge_type.clone()),
+            );
+            out.set(format!("{r_alias}.__edge_seq"), Value::I64(seq as i64));
+            for (key, val) in &props {
+                out.set(format!("{r_alias}.{key}"), val.clone());
+            }
+        }
+        if let Some(path_var) = path_var {
+            out.set(
+                path_var.clone(),
+                Value::Path(PathValue {
+                    nodes: vec![
+                        node::get_node(conn, left_id)?,
+                        node::get_node(conn, right_id)?,
+                    ],
+                    edges: vec![crate::types::Edge {
+                        src: s,
+                        dst: d,
+                        label: edge_type.clone(),
+                        properties: props,
+                    }],
+                }),
+            );
+        }
+        rows.push(out);
     }
-    if let Some(ref v) = dst_pat.variable {
-        rec.set(v.clone(), Value::I64(dst_id.0 as i64));
-    }
-
-    // Bind path variable if present: MERGE p = (a)-[:R]->(b)
-    if let Some(ref path_var) = pattern.path_variable {
-        let src_node = node::get_node(conn, src_id)?;
-        let dst_node = node::get_node(conn, dst_id)?;
-        let edge_props = edge::get_edge_properties(conn, src_id, dst_id, &edge_type)?;
-        let path = PathValue {
-            nodes: vec![src_node, dst_node],
-            edges: vec![crate::types::Edge {
-                src: src_id,
-                dst: dst_id,
-                label: edge_type.clone(),
-                properties: edge_props,
-            }],
-        };
-        rec.set(path_var.clone(), Value::Path(path));
-    }
-
-    Ok(vec![rec])
+    Ok(rows)
 }
 
-/// Find a node matching the MERGE pattern properties, or create it if not found.
+/// Find a node carrying every label in `labels` and matching the pattern
+/// properties, or create it with all of those labels.
 pub(in crate::cypher::executor) fn find_or_create_merge_node(
     conn: &Connection,
-    label: &str,
+    labels: &[String],
     properties: &HashMap<String, Expr>,
 ) -> Result<NodeId> {
     let dummy_rec = NamedRecord::new();
@@ -430,18 +470,15 @@ pub(in crate::cypher::executor) fn find_or_create_merge_node(
         }
         props.insert(key.clone(), val);
     }
-    let matched = find_merge_match_evaluated(conn, label, &props)?;
-    match matched {
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    match find_merge_match_multi_label(conn, &label_refs, &props)? {
         Some(n) => Ok(n.id),
         None => {
-            let labels: Vec<String> = if label.is_empty() {
-                vec![]
-            } else {
-                vec![label.to_string()]
-            };
-            let id = node::create_node(conn, &labels, props.clone())?;
-            index::update_indexes_for_node(conn, id, &labels, None, &props)?;
-            fts::update_fts_for_node(conn, id, &labels, None, &props)?;
+            validate_write_labels(labels)?;
+            validate_write_properties(&props)?;
+            let id = node::create_node(conn, labels, props.clone())?;
+            index::update_indexes_for_node(conn, id, labels, None, &props)?;
+            fts::update_fts_for_node(conn, id, labels, None, &props)?;
             Ok(id)
         }
     }
@@ -469,7 +506,8 @@ pub(in crate::cypher::executor) fn exec_match_merge(
                 PatternElement::Node(n) => n,
                 _ => unreachable!(),
             };
-            let label = node_pat.labels.first().map(|s| s.as_str()).unwrap_or("");
+            let label_refs: Vec<&str> = node_pat.labels.iter().map(String::as_str).collect();
+            let label = label_refs.first().copied().unwrap_or("");
             let mut props = Properties::new();
             for (key, expr) in &node_pat.properties {
                 let val = eval_expr(expr, rec, crate::cypher::eval::EvalCx::new(conn))?;
@@ -480,16 +518,24 @@ pub(in crate::cypher::executor) fn exec_match_merge(
                 }
                 props.insert(key.clone(), val);
             }
-            let matches = find_merge_matches_evaluated(conn, label, &props)?;
+            // Candidates come from the first label (index-assisted); the node
+            // must also carry every other label in the pattern.
+            let matches: Vec<crate::types::Node> =
+                find_merge_matches_evaluated(conn, label, &props)?
+                    .into_iter()
+                    .filter(|n| {
+                        label_refs
+                            .iter()
+                            .all(|req| n.labels.iter().any(|l| l == req))
+                    })
+                    .collect();
             let alias = node_pat.variable.as_deref().unwrap_or("_merge");
 
             if matches.is_empty() {
-                // No match — create a new node.
-                let labels: Vec<String> = if label.is_empty() {
-                    vec![]
-                } else {
-                    vec![label.to_string()]
-                };
+                // No match — create a new node carrying all pattern labels.
+                let labels: Vec<String> = node_pat.labels.clone();
+                validate_write_labels(&labels)?;
+                validate_write_properties(&props)?;
                 let id = node::create_node(conn, &labels, props.clone())?;
                 index::update_indexes_for_node(conn, id, &labels, None, &props)?;
                 fts::update_fts_for_node(conn, id, &labels, None, &props)?;
@@ -564,9 +610,6 @@ pub(in crate::cypher::executor) fn exec_match_merge(
         .variable
         .as_deref()
         .ok_or_else(|| GraphError::semantic("MERGE relationship target must have a variable"))?;
-    let edge_type = rel.rel_types.first().cloned().unwrap_or_default();
-    let undirected = matches!(rel.direction, crate::cypher::ast::RelDirection::Undirected);
-
     for rec in &records {
         let src_id = match rec.get(src_var) {
             Some(Value::I64(id)) => NodeId(*id as u64),
@@ -576,141 +619,22 @@ pub(in crate::cypher::executor) fn exec_match_merge(
             Some(Value::I64(id)) => NodeId(*id as u64),
             _ => continue,
         };
-
-        let mut out_rec = rec.clone();
-
-        // Pre-evaluate merge pattern edge properties.
-        let mut merge_edge_props = Properties::new();
-        for (key, expr) in &rel.properties {
-            let val = eval_expr(expr, rec, crate::cypher::eval::EvalCx::new(conn))?;
-            if val == Value::Null {
-                return Err(GraphError::semantic("MERGE with null property value")
-                    .with_code(ErrorCode::MergeReadOwnWrites));
-            }
-            merge_edge_props.insert(key.clone(), val);
-        }
-
-        // Find all matching edges (possibly multiple parallel edges).
-        // Each matching edge produces one output row.
-        let find_matching_edges = |s: NodeId, d: NodeId| -> Result<Vec<(u64, Properties)>> {
-            let all = edge::get_all_edge_props(conn, s, d, &edge_type)?;
-            if merge_edge_props.is_empty() {
-                return Ok(all);
-            }
-            Ok(all
-                .into_iter()
-                .filter(|(_, props)| {
-                    merge_edge_props
-                        .iter()
-                        .all(|(k, v)| props.get(k) == Some(v))
-                })
-                .collect())
-        };
-
-        // Collect matches from forward direction, and reverse for undirected.
-        let mut matched_edges: Vec<(NodeId, NodeId, u64, Properties)> = Vec::new();
-        for (seq, props) in find_matching_edges(src_id, dst_id)? {
-            matched_edges.push((src_id, dst_id, seq, props));
-        }
-        if undirected {
-            for (seq, props) in find_matching_edges(dst_id, src_id)? {
-                matched_edges.push((dst_id, src_id, seq, props));
-            }
-        }
-
-        if matched_edges.is_empty() {
-            // No match — create new edge.
-            edge::create_edge(conn, src_id, dst_id, &edge_type, merge_edge_props)?;
-            for item in on_create {
-                apply_merge_set_item_edge(conn, item, src_id, dst_id, &edge_type, rec)?;
-            }
-            // Bind the relationship variable for the newly created edge.
-            if let Some(ref r_alias) = rel.variable {
-                out_rec.set(r_alias.clone(), Value::String(edge_type.clone()));
-                out_rec.set(format!("{r_alias}.__src"), Value::I64(src_id.0 as i64));
-                out_rec.set(format!("{r_alias}.__dst"), Value::I64(dst_id.0 as i64));
-                out_rec.set(
-                    format!("{r_alias}.__type"),
-                    Value::String(edge_type.clone()),
-                );
-                let edge_props = edge::get_edge_properties(conn, src_id, dst_id, &edge_type)?;
-                for (key, val) in &edge_props {
-                    out_rec.set(format!("{r_alias}.{key}"), val.clone());
-                }
-            }
-            // Bind path variable if present: MERGE p = (a)-[:R]->(b)
-            if let Some(ref path_var) = merge_pattern.path_variable {
-                let src_node = node::get_node(conn, src_id)?;
-                let dst_node = node::get_node(conn, dst_id)?;
-                let ep = edge::get_edge_properties(conn, src_id, dst_id, &edge_type)?;
-                out_rec.set(
-                    path_var.clone(),
-                    Value::Path(PathValue {
-                        nodes: vec![src_node, dst_node],
-                        edges: vec![crate::types::Edge {
-                            src: src_id,
-                            dst: dst_id,
-                            label: edge_type.clone(),
-                            properties: ep,
-                        }],
-                    }),
-                );
-            }
-            result.push(out_rec);
-        } else {
-            // One or more matches — produce one row per matching edge.
-            for (m_src, m_dst, m_seq, _) in &matched_edges {
-                for item in on_match {
-                    apply_merge_set_item_edge_at(
-                        conn, item, *m_src, *m_dst, &edge_type, *m_seq, rec,
-                    )?;
-                }
-            }
-            for (m_src, m_dst, m_seq, _) in &matched_edges {
-                let mut match_rec = rec.clone();
-                if let Some(ref r_alias) = rel.variable {
-                    match_rec.set(r_alias.clone(), Value::String(edge_type.clone()));
-                    match_rec.set(format!("{r_alias}.__src"), Value::I64(m_src.0 as i64));
-                    match_rec.set(format!("{r_alias}.__dst"), Value::I64(m_dst.0 as i64));
-                    match_rec.set(
-                        format!("{r_alias}.__type"),
-                        Value::String(edge_type.clone()),
-                    );
-                    match_rec.set(format!("{r_alias}.__edge_seq"), Value::I64(*m_seq as i64));
-                    let edge_props =
-                        edge::get_edge_properties_at(conn, *m_src, *m_dst, &edge_type, *m_seq)?;
-                    for (key, val) in &edge_props {
-                        match_rec.set(format!("{r_alias}.{key}"), val.clone());
-                    }
-                }
-                // Bind path variable if present.
-                if let Some(ref path_var) = merge_pattern.path_variable {
-                    let src_node = node::get_node(conn, *m_src)?;
-                    let dst_node = node::get_node(conn, *m_dst)?;
-                    let ep =
-                        edge::get_edge_properties_at(conn, *m_src, *m_dst, &edge_type, *m_seq)?;
-                    match_rec.set(
-                        path_var.clone(),
-                        Value::Path(PathValue {
-                            nodes: vec![src_node, dst_node],
-                            edges: vec![crate::types::Edge {
-                                src: *m_src,
-                                dst: *m_dst,
-                                label: edge_type.clone(),
-                                properties: ep,
-                            }],
-                        }),
-                    );
-                }
-                result.push(match_rec);
-            }
-        }
+        result.extend(merge_edge_between(
+            conn,
+            rec,
+            src_id,
+            dst_id,
+            rel,
+            merge_pattern.path_variable.as_ref(),
+            on_create,
+            on_match,
+        )?);
     }
 
     Ok(result)
 }
 
-/// Execute a CALL procedure: evaluate arguments, filter matching rows, yield columns.
+/// Find a node carrying every label in `labels` and matching `properties`.
 pub(in crate::cypher::executor) fn find_merge_match_multi_label(
     conn: &Connection,
     labels: &[&str],
@@ -768,47 +692,6 @@ pub(in crate::cypher::executor) fn find_merge_matches_by_label_and_props(
                 .all(|(key, expected)| n.properties.get(key) == Some(expected))
         })
         .collect())
-}
-
-/// Find a node matching label + pre-evaluated property values.
-pub(in crate::cypher::executor) fn find_merge_match_evaluated(
-    conn: &Connection,
-    label: &str,
-    properties: &Properties,
-) -> Result<Option<crate::types::Node>> {
-    // Try to find an indexed property.
-    let indexes = index::list_indexes_for_label(conn, label)?;
-    let indexed_props: Vec<String> = indexes
-        .iter()
-        .filter(|info| info.properties.len() == 1)
-        .map(|info| info.properties[0].clone())
-        .collect();
-    let indexed_props: Vec<&str> = indexed_props.iter().map(|s| s.as_str()).collect();
-
-    for (key, value) in properties {
-        if indexed_props.contains(&key.as_str()) {
-            let ids = index::index_lookup(conn, label, key, value)?;
-            // Filter candidates by remaining properties.
-            for id in ids {
-                let n = node::get_node(conn, id)?;
-                let all_match = properties
-                    .iter()
-                    .all(|(k, expected)| n.properties.get(k) == Some(expected));
-                if all_match {
-                    return Ok(Some(n));
-                }
-            }
-            return Ok(None);
-        }
-    }
-
-    // No index available — fall back to label scan.
-    let existing = node::find_nodes_by_label(conn, label)?;
-    Ok(existing.into_iter().find(|n| {
-        properties
-            .iter()
-            .all(|(key, expected)| n.properties.get(key) == Some(expected))
-    }))
 }
 
 /// Find ALL nodes matching label + pre-evaluated property values.

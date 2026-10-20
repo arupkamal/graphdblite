@@ -2,8 +2,6 @@
 //!
 //! Extracted from `executor::mod` to keep the dispatcher file manageable.
 
-use std::collections::HashMap;
-
 use rusqlite::Connection;
 
 use crate::cypher::ast::{Expr, ExprKind};
@@ -18,7 +16,7 @@ use super::read::exec_fulltext_lookup;
 use super::{
     build_compound_binding, check_row_limit, collect_flat_edge_ids, compound_binding_vars, exec,
     exec_aggregate_over_records, exec_id_lookup, exec_index_lookup, exec_scan, fetch_and_populate,
-    has_duplicate_relationships, literal_to_value, node_to_record, ExecContext,
+    has_duplicate_relationships, node_to_record, ExecContext,
 };
 
 /// Correlated inner join: for each left record, execute the right side with
@@ -180,6 +178,7 @@ pub(super) fn exec_correlated(
             property,
             op,
             term,
+            case_insensitive,
             remaining_filters,
         } => {
             // Pass `outer` so the term expression can resolve variables from
@@ -190,6 +189,7 @@ pub(super) fn exec_correlated(
                 alias,
                 property,
                 *op,
+                *case_insensitive,
                 term,
                 remaining_filters.as_ref(),
                 outer,
@@ -367,13 +367,17 @@ pub(super) fn exec_correlated(
                         }
                     } else {
                         // Variable-length traversal — pass ALL labels at once.
-                        let prop_filter_values: HashMap<String, Value> = var_length_prop_filters
-                            .iter()
-                            .filter_map(|(k, expr)| match &expr.kind {
-                                ExprKind::Literal(lit) => Some((k.clone(), literal_to_value(lit))),
-                                _ => None,
-                            })
-                            .collect();
+                        // Evaluate against the row merged over the outer
+                        // bindings so correlated variables resolve too.
+                        let mut eval_rec = outer.clone();
+                        for (k, v) in rec.iter() {
+                            eval_rec.set(k.clone(), v.clone());
+                        }
+                        let prop_filter_values = super::read::eval_var_length_prop_filters(
+                            conn,
+                            var_length_prop_filters,
+                            &eval_rec,
+                        )?;
                         let paths = edge::traverse_paths(
                             conn,
                             src_id,

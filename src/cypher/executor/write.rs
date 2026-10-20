@@ -26,6 +26,8 @@ pub(in crate::cypher::executor) fn exec_create_node(
         props.insert(key.clone(), val);
     }
 
+    validate_write_labels(labels)?;
+    validate_write_properties(&props)?;
     let id = node::create_node(conn, labels, props.clone())?;
     index::update_indexes_for_node(conn, id, labels, None, &props)?;
     fts::update_fts_for_node(conn, id, labels, None, &props)?;
@@ -83,6 +85,8 @@ pub(in crate::cypher::executor) fn exec_create_sequence(
                     }
                     props.insert(key.clone(), val);
                 }
+                validate_write_labels(labels)?;
+                validate_write_properties(&props)?;
                 let id = node::create_node(conn, labels, props.clone())?;
                 index::update_indexes_for_node(conn, id, labels, None, &props)?;
                 fts::update_fts_for_node(conn, id, labels, None, &props)?;
@@ -117,7 +121,9 @@ pub(in crate::cypher::executor) fn exec_create_sequence(
                     }
                     props.insert(key.clone(), val);
                 }
-                edge::create_edge(conn, *src, *dst, edge_type, props.clone())?;
+                validate_write_labels(std::slice::from_ref(edge_type))?;
+                validate_write_properties(&props)?;
+                let seq = edge::create_edge(conn, *src, *dst, edge_type, props.clone())?;
                 // Bind edge metadata for RETURN access.
                 if let Some(r_alias) = rel_alias {
                     last_record.set(r_alias.clone(), Value::String(edge_type.clone()));
@@ -127,6 +133,7 @@ pub(in crate::cypher::executor) fn exec_create_sequence(
                         format!("{r_alias}.__type"),
                         Value::String(edge_type.clone()),
                     );
+                    last_record.set(format!("{r_alias}.__edge_seq"), Value::I64(seq as i64));
                     for (key, val) in &props {
                         last_record.set(format!("{r_alias}.{key}"), val.clone());
                     }
@@ -186,6 +193,8 @@ pub(in crate::cypher::executor) fn exec_match_create(
                         }
                         props.insert(key.clone(), val);
                     }
+                    validate_write_labels(labels)?;
+                    validate_write_properties(&props)?;
                     let id = node::create_node(conn, labels, props.clone())?;
                     index::update_indexes_for_node(conn, id, labels, None, &props)?;
                     fts::update_fts_for_node(conn, id, labels, None, &props)?;
@@ -221,7 +230,9 @@ pub(in crate::cypher::executor) fn exec_match_create(
                         }
                         props.insert(key.clone(), val);
                     }
-                    edge::create_edge(conn, *src, *dst, edge_type, props.clone())?;
+                    validate_write_labels(std::slice::from_ref(edge_type))?;
+                    validate_write_properties(&props)?;
+                    let seq = edge::create_edge(conn, *src, *dst, edge_type, props.clone())?;
                     // Bind edge metadata for RETURN access.
                     if let Some(r_alias) = rel_alias {
                         out_rec.set(r_alias.clone(), Value::String(edge_type.clone()));
@@ -231,6 +242,7 @@ pub(in crate::cypher::executor) fn exec_match_create(
                             format!("{r_alias}.__type"),
                             Value::String(edge_type.clone()),
                         );
+                        out_rec.set(format!("{r_alias}.__edge_seq"), Value::I64(seq as i64));
                         for (key, val) in &props {
                             out_rec.set(format!("{r_alias}.{key}"), val.clone());
                         }
@@ -263,11 +275,11 @@ pub(in crate::cypher::executor) fn exec_delete(
     for rec in &mut records {
         for expr in exprs {
             if let ExprKind::Variable(var) = &expr.kind {
-                collect_var_entities(rec, var, &mut edges_to_delete, &mut nodes_to_delete);
+                collect_var_entities(rec, var, &mut edges_to_delete, &mut nodes_to_delete)?;
                 rec.set(format!("{var}.__deleted"), Value::Bool(true));
             } else {
                 let val = eval_expr(expr, rec, crate::cypher::eval::EvalCx::new(conn))?;
-                collect_value_entities(&val, &mut edges_to_delete, &mut nodes_to_delete);
+                collect_value_entities(&val, &mut edges_to_delete, &mut nodes_to_delete)?;
             }
         }
     }
@@ -306,12 +318,16 @@ pub(in crate::cypher::executor) fn exec_delete(
 }
 
 /// Collect entities from a variable binding for two-phase delete.
+///
+/// Node bindings are stored as `Value::I64(id)` plus an `alias.__id` marker;
+/// a bare integer without the marker is an ordinary integer value (e.g. from
+/// `WITH n.k AS x`) and must not be treated as a node reference.
 pub(in crate::cypher::executor) fn collect_var_entities(
     rec: &NamedRecord,
     var: &str,
     edges: &mut Vec<(NodeId, NodeId, String, Option<u64>)>,
     nodes: &mut Vec<NodeId>,
-) {
+) -> Result<()> {
     let edge_src_key = format!("{var}.__src");
     let edge_dst_key = format!("{var}.__dst");
     let edge_type_key = format!("{var}.__type");
@@ -327,20 +343,44 @@ pub(in crate::cypher::executor) fn collect_var_entities(
             None
         };
         edges.push((NodeId(*src as u64), NodeId(*dst as u64), label.clone(), seq));
-    } else if let Some(Value::I64(id)) = rec.get(var) {
-        nodes.push(NodeId(*id as u64));
-    } else if let Some(val) = rec.get(var).cloned() {
-        collect_value_entities(&val, edges, nodes);
+        return Ok(());
+    }
+    match rec.get(var) {
+        Some(Value::I64(id)) if is_node_binding(rec, var) => {
+            nodes.push(NodeId(*id as u64));
+            Ok(())
+        }
+        Some(val) => {
+            let val = val.clone();
+            collect_value_entities(&val, edges, nodes)
+        }
+        None => Ok(()),
     }
 }
 
-/// Collect entities from a Value for two-phase delete.
+/// Whether `var` in `rec` is a node binding (flat `I64` id + `__id` marker).
+pub(in crate::cypher::executor) fn is_node_binding(rec: &NamedRecord, var: &str) -> bool {
+    matches!(rec.get(var), Some(Value::I64(_)))
+        && matches!(rec.get(&format!("{var}.__id")), Some(Value::I64(_)))
+}
+
+fn not_an_entity(what: &str, val: &Value) -> GraphError {
+    GraphError::type_error(
+        crate::types::QueryPhase::Runtime,
+        format!("{what} requires a node, relationship, or path, got {val:?}"),
+    )
+    .with_code(ErrorCode::InvalidArgumentType)
+}
+
+/// Collect entities from a Value for two-phase delete. Nulls are skipped;
+/// any other non-entity value is a type error.
 pub(in crate::cypher::executor) fn collect_value_entities(
     val: &Value,
     edges: &mut Vec<(NodeId, NodeId, String, Option<u64>)>,
     nodes: &mut Vec<NodeId>,
-) {
+) -> Result<()> {
     match val {
+        Value::Null => {}
         Value::Node(n) => {
             nodes.push(n.id);
         }
@@ -355,15 +395,27 @@ pub(in crate::cypher::executor) fn collect_value_entities(
                 nodes.push(n.id);
             }
         }
-        Value::I64(id) => {
-            nodes.push(NodeId(*id as u64));
-        }
         Value::List(items) => {
             for item in items {
-                collect_value_entities(item, edges, nodes);
+                collect_value_entities(item, edges, nodes)?;
             }
         }
-        _ => {}
+        other => return Err(not_an_entity("DELETE", other)),
+    }
+    Ok(())
+}
+
+/// Reject `SET` / `REMOVE` on a binding that holds a plain (non-entity)
+/// value. Entity bindings and nulls are handled by the callers.
+fn check_set_target(rec: &NamedRecord, var: &str, what: &str) -> Result<()> {
+    if rec.get(&format!("{var}.__src")).is_some() {
+        return Ok(()); // relationship binding
+    }
+    match rec.get(var) {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Node(_)) | Some(Value::Edge(_)) | Some(Value::Path(_)) => Ok(()),
+        Some(Value::I64(_)) if is_node_binding(rec, var) => Ok(()),
+        Some(other) => Err(not_an_entity(what, other)),
     }
 }
 
@@ -377,6 +429,7 @@ pub(in crate::cypher::executor) fn exec_set_property(
     for rec in &mut records {
         for assignment in assignments {
             let var = &assignment.variable;
+            check_set_target(rec, var, "SET")?;
             // Check if this is a relationship variable (has edge identity metadata).
             let edge_src_key = format!("{var}.__src");
             let edge_dst_key = format!("{var}.__dst");
@@ -391,7 +444,7 @@ pub(in crate::cypher::executor) fn exec_set_property(
                     rec,
                     crate::cypher::eval::EvalCx::new(conn),
                 )?;
-                validate_property_value(&val)?;
+                validate_write_value(&assignment.property, &val)?;
                 let edge_seq_key = format!("{var}.__edge_seq");
                 if let Some(Value::I64(seq)) = rec.get(&edge_seq_key) {
                     edge::set_edge_property_at(
@@ -428,7 +481,7 @@ pub(in crate::cypher::executor) fn exec_set_property(
                     rec,
                     crate::cypher::eval::EvalCx::new(conn),
                 )?;
-                validate_property_value(&val)?;
+                validate_write_value(&assignment.property, &val)?;
                 node::set_node_property(conn, node_id, &assignment.property, val.clone())?;
                 let mut new_props = old.properties.clone();
                 if val == Value::Null {
@@ -463,6 +516,67 @@ pub(in crate::cypher::executor) fn exec_set_property(
     Ok(records)
 }
 
+thread_local! {
+    /// `(max_property_value_bytes, max_name_bytes)` for the query currently
+    /// executing on this thread; 0 = unlimited. Installed by
+    /// [`WriteLimitsScope`] from the `ExecContext` in `execute_with_ctx`.
+    static WRITE_LIMITS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// RAII guard that installs the write limits for one query execution and
+/// restores the previous limits (supporting nested executions) on drop.
+pub(crate) struct WriteLimitsScope {
+    prev: (usize, usize),
+}
+
+impl WriteLimitsScope {
+    pub(crate) fn enter(max_property_value_bytes: usize, max_name_bytes: usize) -> Self {
+        let prev = WRITE_LIMITS.with(|c| c.replace((max_property_value_bytes, max_name_bytes)));
+        Self { prev }
+    }
+}
+
+impl Drop for WriteLimitsScope {
+    fn drop(&mut self) {
+        WRITE_LIMITS.with(|c| c.set(self.prev));
+    }
+}
+
+fn current_write_limits() -> (usize, usize) {
+    let (v, n) = WRITE_LIMITS.with(|c| c.get());
+    (
+        if v == 0 { usize::MAX } else { v },
+        if n == 0 { usize::MAX } else { n },
+    )
+}
+
+/// Validate one property assignment written by Cypher: storable type
+/// (no maps / entities, recursively in lists), key length, and value size.
+pub(in crate::cypher::executor) fn validate_write_value(key: &str, val: &Value) -> Result<()> {
+    validate_property_value(val)?;
+    let (max_value, max_name) = current_write_limits();
+    let one = Properties::from([(key.to_string(), val.clone())]);
+    crate::types::validate_properties("", &one, max_name, max_value)
+}
+
+/// [`validate_write_value`] for every entry of a property map.
+pub(in crate::cypher::executor) fn validate_write_properties(props: &Properties) -> Result<()> {
+    for (k, v) in props {
+        validate_write_value(k, v)?;
+    }
+    Ok(())
+}
+
+/// Validate label / relationship-type names written by Cypher against the
+/// configured name-length limit.
+pub(in crate::cypher::executor) fn validate_write_labels(labels: &[String]) -> Result<()> {
+    let (_, max_name) = current_write_limits();
+    for l in labels {
+        crate::types::validate_name_length(l, max_name)?;
+    }
+    Ok(())
+}
+
 /// Validate that a value is storable as a property (no nested maps/nodes/edges).
 pub(in crate::cypher::executor) fn validate_property_value(val: &Value) -> Result<()> {
     match val {
@@ -493,8 +607,10 @@ pub(in crate::cypher::executor) fn exec_set_label(
     let mut records = exec(conn, input, ctx)?;
     for rec in &mut records {
         // Skip null variables (from OPTIONAL MATCH).
+        check_set_target(rec, variable, "SET")?;
         if let Some(Value::I64(id)) = rec.get(variable) {
             let node_id = NodeId(*id as u64);
+            validate_write_labels(labels)?;
             for label in labels {
                 node::add_node_label(conn, node_id, label)?;
             }
@@ -604,7 +720,8 @@ pub(in crate::cypher::executor) fn exec_set_properties(
                     if *v == Value::Null {
                         props.remove(k);
                     } else {
-                        validate_property_value(v)?;
+                        validate_write_value(k, v)?;
+                        crate::types::validate_name(k)?;
                         props.insert(k.clone(), v.clone());
                     }
                 }
@@ -613,7 +730,8 @@ pub(in crate::cypher::executor) fn exec_set_properties(
                 let mut props = Properties::new();
                 for (k, v) in map {
                     if *v != Value::Null {
-                        validate_property_value(v)?;
+                        validate_write_value(k, v)?;
+                        crate::types::validate_name(k)?;
                         props.insert(k.clone(), v.clone());
                     }
                 }
@@ -635,6 +753,7 @@ pub(in crate::cypher::executor) fn exec_set_properties(
         }
 
         // Skip null variables (from OPTIONAL MATCH).
+        check_set_target(rec, variable, "SET")?;
         if let Some(Value::I64(id)) = rec.get(variable) {
             let node_id = NodeId(*id as u64);
             let map_val = eval_expr(value_expr, rec, crate::cypher::eval::EvalCx::new(conn))?;
@@ -658,6 +777,8 @@ pub(in crate::cypher::executor) fn exec_set_properties(
                     if *v == Value::Null {
                         props.remove(k);
                     } else {
+                        validate_write_value(k, v)?;
+                        crate::types::validate_name(k)?;
                         props.insert(k.clone(), v.clone());
                     }
                 }
@@ -667,6 +788,8 @@ pub(in crate::cypher::executor) fn exec_set_properties(
                 let mut props = Properties::new();
                 for (k, v) in map {
                     if *v != Value::Null {
+                        validate_write_value(k, v)?;
+                        crate::types::validate_name(k)?;
                         props.insert(k.clone(), v.clone());
                     }
                 }
@@ -710,6 +833,7 @@ pub(in crate::cypher::executor) fn exec_remove(
         for item in items {
             match item {
                 crate::cypher::ast::RemoveItem::Property { variable, property } => {
+                    check_set_target(rec, variable, "REMOVE")?;
                     // Check if this is an edge variable.
                     let edge_src_key = format!("{variable}.__src");
                     let edge_dst_key = format!("{variable}.__dst");
@@ -779,6 +903,7 @@ pub(in crate::cypher::executor) fn exec_remove(
                     }
                 }
                 crate::cypher::ast::RemoveItem::Label { variable, labels } => {
+                    check_set_target(rec, variable, "REMOVE")?;
                     if let Some(Value::I64(id)) = rec.get(variable) {
                         let id = *id;
                         let node_id = NodeId(id as u64);
