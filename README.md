@@ -1,4 +1,4 @@
-# graphdblite *Arup's Version)
+# graphdblite (Arup's Version)
 
 Embedded graph database with Cypher support, built on SQLite.
 
