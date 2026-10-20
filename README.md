@@ -4,6 +4,8 @@ Embedded graph database with Cypher support, built on SQLite.
 
 - [List of bugs fixed by Claude Opus 5.5](BUGS_FIXED.md)
 - [Comprehensive Documentation](GRAPHDBLITE_REFERENCE.md)
+- [Python: Installing from Github](PIP_INSTALL_FROM_GIT.md)
+- [Python: Building Wheel](PYTHON_PATCHED_BUILD.md)
 
 **Embedded.** Single file, no server, no configuration. Open it, query it, close it — like SQLite.
 
