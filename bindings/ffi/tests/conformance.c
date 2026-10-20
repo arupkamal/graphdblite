@@ -403,11 +403,12 @@ static int bc_11_fulltext_ddl(const char *tmpdir) {
         return fail("BC-11", "ci commit failed");
     }
 
-    /* CI index must serve a case-mismatched CONTAINS query. Two Doc
-     * nodes exist by now: 'hello world' (created earlier) and
-     * 'Hello World' (just created); both match. */
+    /* CI index must serve the toLower CONTAINS idiom. Two Doc nodes exist
+     * by now: 'hello world' (created earlier) and 'Hello World' (just
+     * created); both match. (A plain CONTAINS stays case-sensitive: an
+     * index never changes results.) */
     if (graphdb_query(db,
-            "MATCH (n:Doc) WHERE n.body CONTAINS 'Hello' RETURN n.body",
+            "MATCH (n:Doc) WHERE toLower(n.body) CONTAINS toLower('Hello') RETURN n.body",
             &res) != 0) {
         graphdb_close(db);
         return fail("BC-11", "ci contains query failed");

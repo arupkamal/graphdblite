@@ -337,8 +337,9 @@ func TestCreateFulltextIndexCI(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Case-mismatched CONTAINS must hit the CI FTS rewrite path.
-	res, err = db.Query("MATCH (n:Doc) WHERE n.body CONTAINS 'hello' RETURN n.body")
+	// The toLower idiom must hit the CI FTS rewrite path (plain CONTAINS
+	// stays case-sensitive: an index never changes results).
+	res, err = db.Query("MATCH (n:Doc) WHERE toLower(n.body) CONTAINS toLower('hello') RETURN n.body")
 	if err != nil {
 		t.Fatalf("contains query: %v", err)
 	}

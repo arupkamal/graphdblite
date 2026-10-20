@@ -19,7 +19,7 @@ test('createIndex / dropIndex round-trip', () => {
   }
 });
 
-test('createFulltextIndexCi enables case-insensitive CONTAINS via FTS', () => {
+test('createFulltextIndexCi serves the toLower CONTAINS idiom via FTS', () => {
   const db = gdb.Database.openMemory();
   try {
     const tx = db.beginWrite();
@@ -27,9 +27,14 @@ test('createFulltextIndexCi enables case-insensitive CONTAINS via FTS', () => {
     tx.execute("CREATE (:Doc {body: 'Hello World'})");
     tx.commit();
 
-    const rows = db.query("MATCH (n:Doc) WHERE n.body CONTAINS 'hello' RETURN n.body AS body");
+    const rows = db.query(
+      "MATCH (n:Doc) WHERE toLower(n.body) CONTAINS toLower('hello') RETURN n.body AS body",
+    );
     assert.equal(rows.length, 1);
     assert.equal(rows[0].body, 'Hello World');
+    // An index never changes results: plain CONTAINS stays case-sensitive.
+    const plain = db.query("MATCH (n:Doc) WHERE n.body CONTAINS 'hello' RETURN n.body AS body");
+    assert.equal(plain.length, 0);
 
     const tx2 = db.beginWrite();
     tx2.dropFulltextIndex('Doc', 'body');
